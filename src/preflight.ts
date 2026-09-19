@@ -13,7 +13,6 @@
  * server-side file — a model that is not on disk is reported, never obtained.
  */
 import type { ComfyUIHistoryEntry } from './comfyui.js'
-import type { Workflow } from './params.js'
 
 /** Node-input spec shapes as `object_info` reports them. */
 interface NodeDefinition {
@@ -257,24 +256,6 @@ export async function requireObjectInfo(
     const cause = error instanceof Error ? error.message : String(error)
     return { ok: false, objectInfo: null, failure: preflightUnavailable(cause) }
   }
-}
-
-/**
- * The one submit-time check every path goes through: fetch the definitions and
- * evaluate the **final** workflow (parameters already applied) against them.
- * Throws `PreflightRefusal` on either a gap or an unreadable snapshot, so no
- * caller can submit past it.
- */
-export async function preflightApproved(
-  workflow: Workflow,
-  fetch: () => Promise<Record<string, unknown>>,
-  runDir: string,
-): Promise<Record<string, unknown>> {
-  const snapshot = await requireObjectInfo(fetch)
-  if (!snapshot.ok) throw new PreflightRefusal(snapshot.failure)
-  const result = preflightWorkflow(workflow as unknown as Record<string, { class_type: string; inputs: Record<string, unknown> }>, snapshot.objectInfo)
-  if (!result.ok) throw new PreflightRefusal(preflightFailure(result, runDir))
-  return snapshot.objectInfo
 }
 
 /**
