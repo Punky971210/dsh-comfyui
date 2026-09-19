@@ -630,6 +630,28 @@ function refusedRun(
   }
 }
 
+/**
+ * The async takeover failed **after** the prompt was submitted: the job could
+ * not be started, but ComfyUI already has the prompt and may still finish it.
+ * The run is therefore not "not submitted", and the row cannot stay `queued`.
+ *
+ * Two things have to come out of this failure. The row the reservation opened
+ * must be closed out (the sequence number is spent), and it must carry the
+ * **real** `promptId` — that is the only handle `comfyui_fetch_output` has on a
+ * run whose job never existed, and without it a submitted prompt is
+ * unreachable. The message keeps the `background jobs unavailable` fragment
+ * callers match on, and says in so many words that the submit already happened,
+ * so it is never read as "nothing was sent".
+ */
+function jobsTakeoverFailure(tool: string, promptId: string, runLabel: string, cause: unknown): RunFailure {
+  const reason = cause instanceof Error ? cause.message : String(cause)
+  return {
+    code: 'JOBS_UNAVAILABLE',
+    message: `${tool}: background jobs unavailable — 后台任务接管失败(${reason})。注意：prompt 已提交到 ComfyUI、可能仍会执行完成，promptId=${promptId}（runLabel=${runLabel}），可用 comfyui_fetch_output 以该 promptId 取回结果。接管能力需加载 @deepseek-ai/dsh-jobs-local 与 @deepseek-ai/dsh-tool-jobs。`,
+    nodeErrors: null,
+  }
+}
+
 function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
   return {
     name: 'comfyui_run',
@@ -773,50 +795,62 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
       base.promptId = promptId
 
       if (mode === 'async') {
-        const jobs = ctx.get('jobs') as JobsService
-        const jobId = jobs.start({
-          kind: 'comfyui',
-          label,
-          ...(exec.agent !== undefined ? { owner: exec.agent } : {}),
-          run: () => {
-            let terminal: RunResult | undefined
-            const done = (async () => {
-              const record = { ...base }
-              await waitAndRecord(
-                runtime, client, promptId, config, new AbortController().signal, waitMs, record, runDir,
-                (state) => {
-                  terminal = {
-                    kind: 'sync',
-                    promptId,
-                    runLabel,
-                    status: state.status,
-                    elapsedMs: state.durationMs,
-                    media: state.media,
-                    summary: summarizeMedia(state.media),
-                    seed,
-                    seeds: Object.keys(seeds).length > 0 ? seeds : null,
-                    ledger: runDir,
-                    error: state.errors === null ? null : {
-                      code: 'EXECUTION_FAILED',
-                      message: firstErrorText(state.errors),
-                      nodeErrors: state.errors,
-                    },
-                  }
-                },
-              )
-              if (terminal === undefined) {
-                return { status: 'failed' as const, detail: 'comfyui', output: `run ${runLabel} produced no terminal state` }
+        let jobId: string
+        try {
+          const jobs = ctx.get('jobs') as JobsService
+          jobId = jobs.start({
+            kind: 'comfyui',
+            label,
+            ...(exec.agent !== undefined ? { owner: exec.agent } : {}),
+            run: () => {
+              let terminal: RunResult | undefined
+              const done = (async () => {
+                const record = { ...base }
+                await waitAndRecord(
+                  runtime, client, promptId, config, new AbortController().signal, waitMs, record, runDir,
+                  (state) => {
+                    terminal = {
+                      kind: 'sync',
+                      promptId,
+                      runLabel,
+                      status: state.status,
+                      elapsedMs: state.durationMs,
+                      media: state.media,
+                      summary: summarizeMedia(state.media),
+                      seed,
+                      seeds: Object.keys(seeds).length > 0 ? seeds : null,
+                      ledger: runDir,
+                      error: state.errors === null ? null : {
+                        code: 'EXECUTION_FAILED',
+                        message: firstErrorText(state.errors),
+                        nodeErrors: state.errors,
+                      },
+                    }
+                  },
+                )
+                if (terminal === undefined) {
+                  return { status: 'failed' as const, detail: 'comfyui', output: `run ${runLabel} produced no terminal state` }
+                }
+                return terminal.status === 'error'
+                  ? { status: 'failed' as const, detail: 'comfyui', output: JSON.stringify(terminal) }
+                  : { status: 'completed' as const, output: JSON.stringify(terminal) }
+              })()
+              return {
+                cancel: () => { void client.interrupt().catch(() => undefined) },
+                done,
               }
-              return terminal.status === 'error'
-                ? { status: 'failed' as const, detail: 'comfyui', output: JSON.stringify(terminal) }
-                : { status: 'completed' as const, output: JSON.stringify(terminal) }
-            })()
-            return {
-              cancel: () => { void client.interrupt().catch(() => undefined) },
-              done,
-            }
-          },
-        })
+            },
+          })
+        } catch (error) {
+          // Submitted but not taken over: the row is closed out with the real
+          // promptId before the caller hears about it, so no `queued` row is
+          // left behind and the submitted prompt stays fetchable (BI-1). The
+          // error is re-thrown rather than returned — the caller must not read
+          // a failed takeover as a background run that started.
+          const failure = jobsTakeoverFailure('comfyui_run', promptId, runLabel, error)
+          upsertRun(runDir, { ...base, status: 'failed', durationMs: Date.now() - startedAt, error: failure })
+          throw new Error(failure.message)
+        }
         const result: BackgroundResult = { kind: 'background', jobId, promptId, runLabel, label, seed, ledger: runDir }
         return result
       }
@@ -1324,49 +1358,59 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
       const record: LedgerRecord = { ...base, promptId }
 
       if (mode === 'async') {
-        const jobs = ctx.get('jobs') as JobsService
-        const jobId = jobs.start({
-          kind: 'comfyui',
-          label: saved.name,
-          ...(exec.agent !== undefined ? { owner: exec.agent } : {}),
-          run: () => {
-            const done = (async () => {
-              let terminal: RunResult | undefined
-              await waitAndRecord(
-                runtime, client, promptId, config, new AbortController().signal, waitMs, record, runDir,
-                (state) => {
-                  terminal = {
-                    kind: 'sync',
-                    promptId,
-                    runLabel,
-                    status: state.status,
-                    elapsedMs: state.durationMs,
-                    media: state.media,
-                    summary: summarizeMedia(state.media),
-                    seed: null,
-                    seeds: null,
-                    ledger: runDir,
-                    error: state.errors === null ? null : {
-                      code: 'EXECUTION_FAILED',
-                      message: firstErrorText(state.errors),
-                      nodeErrors: state.errors,
-                    },
-                  }
-                },
-              )
-              if (terminal === undefined) {
-                return { status: 'failed' as const, detail: 'comfyui', output: `run ${runLabel} produced no terminal state` }
+        let jobId: string
+        try {
+          const jobs = ctx.get('jobs') as JobsService
+          jobId = jobs.start({
+            kind: 'comfyui',
+            label: saved.name,
+            ...(exec.agent !== undefined ? { owner: exec.agent } : {}),
+            run: () => {
+              const done = (async () => {
+                let terminal: RunResult | undefined
+                await waitAndRecord(
+                  runtime, client, promptId, config, new AbortController().signal, waitMs, record, runDir,
+                  (state) => {
+                    terminal = {
+                      kind: 'sync',
+                      promptId,
+                      runLabel,
+                      status: state.status,
+                      elapsedMs: state.durationMs,
+                      media: state.media,
+                      summary: summarizeMedia(state.media),
+                      seed: null,
+                      seeds: null,
+                      ledger: runDir,
+                      error: state.errors === null ? null : {
+                        code: 'EXECUTION_FAILED',
+                        message: firstErrorText(state.errors),
+                        nodeErrors: state.errors,
+                      },
+                    }
+                  },
+                )
+                if (terminal === undefined) {
+                  return { status: 'failed' as const, detail: 'comfyui', output: `run ${runLabel} produced no terminal state` }
+                }
+                return terminal.status === 'error'
+                  ? { status: 'failed' as const, detail: 'comfyui', output: JSON.stringify(terminal) }
+                  : { status: 'completed' as const, output: JSON.stringify(terminal) }
+              })()
+              return {
+                cancel: () => { void client.interrupt().catch(() => undefined) },
+                done,
               }
-              return terminal.status === 'error'
-                ? { status: 'failed' as const, detail: 'comfyui', output: JSON.stringify(terminal) }
-                : { status: 'completed' as const, output: JSON.stringify(terminal) }
-            })()
-            return {
-              cancel: () => { void client.interrupt().catch(() => undefined) },
-              done,
-            }
-          },
-        })
+            },
+          })
+        } catch (error) {
+          // Second path, same contract as `comfyui_run`: close the row out with
+          // the real promptId, then re-throw instead of reporting a background
+          // job that was never started.
+          const failure = jobsTakeoverFailure('comfyui_workflow', promptId, runLabel, error)
+          upsertRun(runDir, { ...record, status: 'failed', durationMs: Date.now() - startedAt, error: failure })
+          throw new Error(failure.message)
+        }
         const background: BackgroundResult = { kind: 'background', jobId, promptId, runLabel, label: saved.name, seed: null, ledger: runDir }
         return { action: 'run', id, workflowName: saved.name, background }
       }
