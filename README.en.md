@@ -31,10 +31,22 @@
 
 The agent drives ComfyUI directly, no canvas work needed:
 
-- `comfyui_run` — submit an API-format workflow or a built-in template (`txt2img` / `img2img` / `video`) and get media back; `mode: "sync"` waits for the result, `mode: "async"` runs a background job (recommended for video).
+- `comfyui_run` — submit an API-format workflow or a built-in template (`txt2img` / `img2img` / `video`) and get media back; `mode: "sync"` waits for the result, `mode: "async"` runs a background job (recommended for video). The workflow is **preflighted against the server's node definitions before anything is submitted**: unregistered class types and loader values that are not on disk (e.g. a missing `ckpt_name`) refuse the run and list both the missing value and the available ones — **nothing is submitted and no model is ever downloaded**. Every run is recorded in the run ledger; `seed` writes one concrete seed into every seed input and records it, `run_label` sets the governance identity (default `<COMFYUI_RUN_PREFIX or comfyui>-<NNNN>`, auto-incrementing).
 - `comfyui_object_info` — list the node definitions your ComfyUI server supports, so the agent can build valid workflows on the fly.
+- `comfyui_probe` — the capability gate to run before submitting: `/system_stats` readiness, device and free VRAM, the checkpoint models the server can actually load, and the queue backlog. A server that is down or is not ComfyUI answers `ready: false` with a readable error instead of throwing.
+- `comfyui_fetch_output` — bring a run's media **onto this machine**: by `promptId` (every output of that prompt) or by `filename` (one file, with `subfolder`/`type`). Existing files are never overwritten (`out.png` → `out.01.png`), and the absolute paths and sizes are written back onto that run's ledger row.
 - `comfyui_workflow` — manage the plugin's runnable-workflow library: `list` (server address, local ComfyUI dirs, load-area media, per-workflow parameter lists), `run` (by id + parameter overrides), `skill` (on-demand read of a workflow's skill pack), `refresh` (re-derive a parameter snapshot).
 - `comfyui_skill` — read and write workflow skill packs (`list` / `read` / `write` / `append` / `mkdir` / `rename` / `delete` / `enable` / `require`); the agent can write its lessons back into a pack and reuse them across sessions.
+
+#### Run ledger (`runs.json`)
+
+It lives in the configured download directory (`downloadDir`, default `<data dir>/runs/`), beside the fetched media, and is what makes a run auditable and replayable:
+
+- **Identity is `runLabel` first, `promptId` second.** `runLabel` is the governance key (`<batch>-<lane>-<job>`) a caller can predict and address.
+- **`queued` → terminal is an overwrite of the same row**, not a second append: the queued snapshot is written before submit and replaced in place once the run reaches completed / failed / interrupted; `comfyui_fetch_output` later fills the downloaded paths and sizes into that same row by `promptId`.
+- **Sequences increment**: `comfyui-0001`, `comfyui-0002`, … under one prefix, and output files sharing a name get a two-digit stem suffix (`out.01.png`) so two runs never overwrite each other.
+- **The seed is written down** — the actual value in every seed input (`seed` plus per-input `seeds`), never `-1`, never server-side randomness, so the run replays.
+- **Corruption is survivable**: a missing or damaged ledger degrades to an empty table with a note; bookkeeping never blocks generation.
 
 ### UI panel
 

@@ -31,10 +31,22 @@
 
 Agent 直接驱动 ComfyUI，无需手动操作画布：
 
-- `comfyui_run` —— 提交 API 格式工作流或内置模板（txt2img / img2img / video），返回生成媒体；`mode: "sync"` 等待结果，`mode: "async"` 后台任务（视频生成强烈建议）。
+- `comfyui_run` —— 提交 API 格式工作流或内置模板（txt2img / img2img / video），返回生成媒体；`mode: "sync"` 等待结果，`mode: "async"` 后台任务（视频生成强烈建议）。**提交前先做预检**：读服务端节点定义，校验节点类型与加载器取值（如 `ckpt_name`）是否真的存在，缺项直接拒绝提交并列出缺失值与可用值——**模型未就位时不提交、也绝不自动下载**。每次运行写入运行台账，`seed` 参数会把一个确定种子写进图内所有 seed 输入并落盘，`run_label` 指定治理身份（缺省 `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>` 自动递增）。
 - `comfyui_object_info` —— 列出服务器支持的节点定义，让 Agent 现场构造合法工作流。
+- `comfyui_probe` —— 提交前的能力门禁：`/system_stats` 就绪性 + 设备/显存 + 可加载的 checkpoint 清单 + 队列积压；服务不可达/不是 ComfyUI 时返回 `ready: false` 与可读错误，而不是抛异常。
+- `comfyui_fetch_output` —— 把生成结果**落盘取件**：按 `promptId`（整个 prompt 的全部输出）或 `filename`（单文件，配 `subfolder`/`type`）下载到本机目录，同名文件自动递增后缀（`out.png` → `out.01.png`）不覆盖，绝对路径与体积回填到该次运行的台账条目。
 - `comfyui_workflow` —— 管理插件工作流库：`list`（含服务器地址、本机 ComfyUI 目录、加载区素材、每个工作流的参数清单）、`run`（按 id 运行 + 参数覆盖）、`skill`（按需读取某工作流的技能包）、`refresh`（重算参数快照）。
 - `comfyui_skill` —— 读写工作流技能包（`list` / `read` / `write` / `append` / `mkdir` / `rename` / `delete` / `enable` / `require`），Agent 可把踩坑经验写回技能包，跨会话复用。
+
+#### 运行台账（runs.json）
+
+落在配置的下载目录（设置页 `downloadDir`，缺省 `<数据目录>/runs/`），与取件产物同目录，供审计与复跑：
+
+- **身份键 `runLabel` 优先，缺失退 `promptId`**；`runLabel` 形如 `<批次>-<lane>-<job>`，是治理批可预测、可寻址的键。
+- **`queued` → 终态同键覆盖**（不是追加两行）：提交前先落 `queued` 快照，任务到 completed / failed / interrupted 时**就地覆盖同一条记录**；`comfyui_fetch_output` 后续按 `promptId` 把下载路径与体积回填到同一行。
+- **序号递增**：同一前缀下 `comfyui-0001`、`comfyui-0002`… 递增；输出文件同名时 `stem` 追加两位序号（`out.01.png`），两次运行互不覆盖。
+- **seed 落盘**：写入图内所有 seed 输入的实际值（`seed` 字段 + 逐输入 `seeds`），禁 `-1`、禁服务端随机，落盘即可复跑。
+- **损坏容错**：台账缺失/损坏按空表处理并给出提示，记账不可阻塞生成。
 
 ### UI 面板
 

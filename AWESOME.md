@@ -5,13 +5,13 @@
 ## 建议条目（英文）
 
 ```markdown
-- [dsh-comfyui](https://github.com/fandc520/dsh-comfyui) — Let the DeepSeek Harness agent smartly drive a local or remote ComfyUI to generate anything: agent tools (`comfyui_run`, `comfyui_object_info`, `comfyui_workflow`, `comfyui_skill`), workflow/asset/queue panel with graph extract (whole/per component/main flow), load-area media loader, per-workflow skill packs, SDXL & Wan 2.1 templates, a companion skill and a same-origin media proxy. `dsh plugin --profile web add dsh-comfyui` (web) / `dsh plugin --profile desktop add dsh-comfyui` (desktop)
+- [dsh-comfyui](https://github.com/fandc520/dsh-comfyui) — Let the DeepSeek Harness agent smartly drive a local or remote ComfyUI to generate anything: agent tools (`comfyui_run`, `comfyui_object_info`, `comfyui_probe`, `comfyui_fetch_output`, `comfyui_workflow`, `comfyui_skill`; submit-time object_info preflight, run ledger with a written-down seed), workflow/asset/queue panel with graph extract (whole/per component/main flow), load-area media loader, per-workflow skill packs, SDXL & Wan 2.1 templates, a companion skill and a same-origin media proxy. `dsh plugin --profile web add dsh-comfyui` (web) / `dsh plugin --profile desktop add dsh-comfyui` (desktop)
 ```
 
 ## 建议条目（中文，如站点支持）
 
 ```markdown
-- [dsh-comfyui](https://github.com/fandc520/dsh-comfyui) — 让 DeepSeek Harness 的 Agent 智能驱动本地或远程 ComfyUI 生成任何内容：Agent 工具（`comfyui_run` / `comfyui_object_info` / `comfyui_workflow` / `comfyui_skill`）、工作流/资产/队列面板（图工作流提取：整体/按分量/主流程）、加载区媒体加载器、工作流技能包挂载、SDXL / Wan 2.1 模板、配套 skill 与同源媒体代理。`dsh plugin --profile web add dsh-comfyui`（web）/ `dsh plugin --profile desktop add dsh-comfyui`（desktop）
+- [dsh-comfyui](https://github.com/fandc520/dsh-comfyui) — 让 DeepSeek Harness 的 Agent 智能驱动本地或远程 ComfyUI 生成任何内容：Agent 工具（`comfyui_run` / `comfyui_object_info` / `comfyui_probe` / `comfyui_fetch_output` / `comfyui_workflow` / `comfyui_skill`；提交前 object_info 预检、运行台账与 seed 落盘）、工作流/资产/队列面板（图工作流提取：整体/按分量/主流程）、加载区媒体加载器、工作流技能包挂载、SDXL / Wan 2.1 模板、配套 skill 与同源媒体代理。`dsh plugin --profile web add dsh-comfyui`（web）/ `dsh plugin --profile desktop add dsh-comfyui`（desktop）
 ```
 
 ## 发布前核对清单

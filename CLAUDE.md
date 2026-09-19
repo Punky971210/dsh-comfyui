@@ -57,7 +57,7 @@ Agent ──tools──┐
 | 文件 | 职责 |
 | --- | --- |
 | `index.ts` | 插件入口：解析配置、组装 `ComfyUIRuntime`、注册设置节 / 工具 / skill / 路由 / 媒体代理，全部挂在 fiber 上随插件卸载。`export const inject = ['tools']`。设置节经 `ctx.inject(['settings'])` 子 fiber 调 `settings.installSection(ctx, 'comfyui', Config, resolved, { setSource, onChange })` 注册（settings 是可选服务，无该服务的 headless 宿主静默跳过）；hint 文案里的 `settingsNamespace` 已移除，命名空间就是字面量 `'comfyui'`。 |
-| `config.ts` | schemastery 配置 schema（同时供 cordis.yml 入口配置和 `comfyui:` 设置节使用）+ 同形状的 TS 类型。`outputDir` 只走 cordis.yml，留空时删除资产会自行推断 ComfyUI 输出目录。`skillsDir` 指定技能包根目录（留空 = `<dataDir>/skills`，必须绝对路径，相对值忽略；运行时经 getter 现读，设置页改完即生效，但不会自动搬走已有目录）。`comfyuiDirs`（字符串数组，可多填）记录用户本机 ComfyUI 安装目录（目录映射/多实例/便携版），Agent 据此定位 models、自定义节点、TTS 音色库等文件；变更经 `onChange` 热同步到 runtime 配置，无需重启。 |
+| `config.ts` | schemastery 配置 schema（同时供 cordis.yml 入口配置和 `comfyui:` 设置节使用）+ 同形状的 TS 类型。`outputDir` 只走 cordis.yml，留空时删除资产会自行推断 ComfyUI 输出目录；`downloadDir` 是**本插件的**落盘目录（运行台账 `runs.json` + `comfyui_fetch_output` 下载的媒体），留空 = `<dataDir>/runs`，与 `outputDir`（ComfyUI 自己的输出目录）语义不同不可混用。`skillsDir` 指定技能包根目录（留空 = `<dataDir>/skills`，必须绝对路径，相对值忽略；运行时经 getter 现读，设置页改完即生效，但不会自动搬走已有目录）。`comfyuiDirs`（字符串数组，可多填）记录用户本机 ComfyUI 安装目录（目录映射/多实例/便携版），Agent 据此定位 models、自定义节点、TTS 音色库等文件；变更经 `onChange` 热同步到 runtime 配置，无需重启。 |
 | `comfyui.ts` | ComfyUI HTTP 客户端：queuePrompt / history / queue / jobs / userdata / object_info / view / upload / interrupt 等，加上 `collectMedia`、`mediaProxyUrl`、`waitForCompletion`。上传有两个入口：`uploadFile` 转发浏览器原样的 multipart，`uploadMedia` 用 FormData 包好字节再传（`/upload/image` 只吃 multipart，裸 body 会 400）。模块级 `CLIENT_ID` 让排队与 WS 进度同源。 |
 | `store.ts` | 持久化：工作流库、资产索引、加载区加载位（`LoadSlot[]`，`null` = 空位，兼容旧的单图格式）、媒体尺寸、上传哈希、任务跟踪，均为 dataDir 下的 JSON 文件；`skillsRoot` 指向技能包目录树，`updateWorkflowSkill` 单独维护 `skillDir` / `requireSkill`（普通保存不碰这两个字段）。 |
 | `queue.ts` | `QueueTracker`：记住本插件提交过的 prompt，`sweep()` 在读取（queue/assets 路由）时把完成的运行归档进资产索引；无后台定时器。 |
@@ -66,7 +66,9 @@ Agent ──tools──┐
 | `convert.ts` | 图 → API 转换：链接变 `[String(nodeId), slot]`，widgets_values 按图节点自身 `inputs` 顺序对齐，Reroute/bypass 直通，无法表达的节点报错。 |
 | `params.ts` | 可调参数：自动识别（提示词/分辨率/步数/种子/时长/宽高比/加载节点）+ 用户高级参数；`numberSpecOf` 从 object_info 读数字输入的声明类型（INT/FLOAT + min/max/step），存进参数的 `numberKind`；`applyWorkflowParameters` 在运行时写回工作流（int 四舍五入、bool 归一化 `"true"`/`0` 这类写法、连线输入与加载参数不被空默认值覆盖、未传值的加载参数按加载位顺序取用）；`refreshParameterMetadata` 按最新 object_info 重算**已有**参数的 options / numberKind / min/max/step（参数集合与默认值一个不动，供快照刷新路由/工具用，返回 `{ parameters, changed }`）。 |
 | `templates.ts` | 内置 API 模板：`txt2img`、`img2img`（核心节点）、`video`（Wan 2.1，需 ComfyUI-WanVideoWrapper）。 |
-| `tools.ts` | 模型侧工具定义与注册 + `ComfyUIRuntime` 接口 + 后台任务/结果回显。 |
+| `ledger.ts` | 运行台账 `runs.json`（落在 `downloadDir`，缺省 `<dataDir>/runs`）：身份键 `runLabel` 优先、缺失退 `promptId`；`queued` → 终态**同键覆盖**（非追加）；`nextJobNumber` 按 `<prefix>-<NNNN>` 扫两种身份字段求下一个序号；`uniqueOutputPath` 做 `stem.NN` 递增防覆盖；`safeRelativePath` 禁 `..`/绝对路径逃逸；读写**同步**（同一次调用路径上不接受并发交错），损坏/缺失按空表 + note 降级，**记账失败不阻塞生成**。 |
+| `preflight.ts` | 提交前预检：只用调用方已取得的 object_info 快照，校验 ① `class_type` 已注册 ② 加载器输入（声明为取值清单的那些，如 `ckpt_name`/`unet_name`）的当前值 ∈ 清单，逐条产出 `{nodeId, classType, inputKey, value, code}`；`preflightUnavailable` 把「读不到 object_info」记为独立错误码（**不视为放行**）；`extractNodeErrors` 从 history 的 `status.messages` 提取 `execution_error` 结构化明细。**纯只读**：不下载、不安装、不改服务端文件。 |
+| `tools.ts` | 模型侧工具定义与注册（`comfyUIToolDefinitions` 统一导出，注册与 schema 自校验共用同一清单）+ `ComfyUIRuntime` 接口 + 后台任务/结果回显；`waitAndRecord` 是四条运行路径共用的「等完成 → 写终态 → 回收据」单点；注册逐工具 `try/catch`，单个工具注册失败只告警不崩装载链。 |
 | `routes.ts` | 浏览器侧同源 HTTP 路由（面板与设置页的全部数据来源），写操作强制同源。 |
 | `proxy.ts` | `/comfyui/media` 媒体代理：主路径按 `file`+`subfolder`+`type` 直取（不依赖 history），旧的 prompt/node/index 链接先查 history，查不到再回落到资产索引里的文件引用。 |
 | `http.ts` | 路由小工具：`sendJson` / `readJsonBody` / `readRawBody` / `sameOrigin` / `errorMessage`。 |
@@ -79,10 +81,14 @@ Agent ──tools──┐
 
 | 工具 | 作用 |
 | --- | --- |
-| `comfyui_run` | 提交 `workflow`（API 格式）或 `template`（txt2img / img2img / video），`inputs` 按节点 id 覆盖输入；`mode: sync`（默认，返回媒体）/ `async`（返回 job id，用 `job_output` 收结果）。 |
+| `comfyui_run` | 提交 `workflow`（API 格式）或 `template`（txt2img / img2img / video），`inputs` 按节点 id 覆盖输入；`mode: sync`（默认，返回媒体）/ `async`（返回 job id，用 `job_output` 收结果）。**提交前必过 `preflight.ts` 预检**（节点类型已注册 + 加载器取值在 object_info 清单内），缺项返回结构化错误（`code: PREFLIGHT` + `nodeErrors`，含缺失值与可用值）且**零提交、零下载**；object_info 读不到时单独报 `PREFLIGHT_UNAVAILABLE`（不视为放行）。`seed` 参数写进图内所有 seed 输入并落盘（显式 seed 优先于图内 authored 值），`run_label` 指定台账身份键（缺省 `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>` 递增）。 |
 | `comfyui_object_info` | 列出服务器支持的节点定义，可用 `filter` 按类名子串收窄。 |
+| `comfyui_probe` | 提交前能力门禁：`/system_stats` 就绪性、设备/`vram_free`、`CheckpointLoaderSimple` 的 `ckpt_name` 清单、队列积压（running + pending）。服务不可达/不是 ComfyUI 返回 `ready: false` + `{code, message, status}`，**不抛**。可选 `host`/`port`/`timeoutMs` 覆盖目标。 |
+| `comfyui_fetch_output` | 落盘取件：`promptId`（`/history/<id>` 的全部媒体）**或** `filename`+`subfolder`+`type`（单文件）——二选一**只能在 execute 内判定**（本机 dsh-tools 子集在 object 根不支持 `oneOf`，schema 级表达不了，属已知边界）；`stem.NN` 递增防覆盖；`absPath`/`size` 回填到同一条台账记录。 |
 | `comfyui_skill` | 读写某个工作流的技能包（Agent 自治维护文档）：`list` / `read` / `write` / `append` / `mkdir` / `rename` / `delete` / `enable` / `require`，都要带 `workflow_id`。`read` 到 `SKILL.md` 同样解除 `requireSkill` 拦截（与 `comfyui_workflow action: skill` 共用那个 WeakMap）。**没有 destroy**：整包删除是用户在面板上的决定。单次 `read` 超过 40k 字符会截断。 |
-| `comfyui_workflow` | `action: list` 列出库里可运行工作流（参数清单含 `numberKind` 整数/小数标注；挂了技能包的多一个 `skill` 字段：一句摘要 + 文件数 + 是否必读，**只有这一行进上下文**）+ ComfyUI 端图工作流（含 `extracted` / `derived`）+ `loadArea`（加载位数量与已放入的素材，Agent 据此知道用户加载了什么）+ `env`（**每次调用现读**：`baseUrl` 服务器地址 + `comfyuiDirs` 用户配置的本机 ComfyUI 目录，供定位文件/音色库用；改动契约，勿改形状）；`action: run` 按 id 运行并传 `parameters` 覆盖；`action: skill` 按 id 返回该工作流技能包的 `SKILL.md` 正文 + 绝对目录 + 文件清单（渲染成 `<skill_content>` 块；读过才解除 `requireSkill` 拦截）；`action: get` 仅供诊断（输出完整 JSON，很费 token）；`action: refresh` 按 id 重算该工作流的参数快照并写回（先强制 TTS 音色库重扫 `?refresh=1` 再读最新 object_info，只更新 options / numberKind / min/max/step 等派生字段，**参数集合与用户手加的高级参数原样保留**，返回 `changed` 清单——音色库/节点定义变更后跑它，否则 run 对新音色会报"not one of the allowed options"）。 |
+| `comfyui_workflow` | `action: list` 列出库里可运行工作流（参数清单含 `numberKind` 整数/小数标注；挂了技能包的多一个 `skill` 字段：一句摘要 + 文件数 + 是否必读，**只有这一行进上下文**）+ ComfyUI 端图工作流（含 `extracted` / `derived`）+ `loadArea`（加载位数量与已放入的素材，Agent 据此知道用户加载了什么）+ `env`（**每次调用现读**：`baseUrl` 服务器地址 + `comfyuiDirs` 用户配置的本机 ComfyUI 目录，供定位文件/音色库用；改动契约，勿改形状）；`action: run` 按 id 运行并传 `parameters` 覆盖（与 `comfyui_run` 共用同一台账，`run_label` 可指定身份键）；`action: skill` 按 id 返回该工作流技能包的 `SKILL.md` 正文 + 绝对目录 + 文件清单（渲染成 `<skill_content>` 块；读过才解除 `requireSkill` 拦截）；`action: get` 仅供诊断（输出完整 JSON，很费 token）；`action: refresh` 按 id 重算该工作流的参数快照并写回（先强制 TTS 音色库重扫 `?refresh=1` 再读最新 object_info，只更新 options / numberKind / min/max/step 等派生字段，**参数集合与用户手加的高级参数原样保留**，返回 `changed` 清单——音色库/节点定义变更后跑它，否则 run 对新音色会报"not one of the allowed options"）。 |
+
+**工具 schema 通道（改动前必读）**：本插件全部工具走 **raw `ctx.tools.register`**（上游 `tools.ts` 自造 `ToolDefinition`），`parameters` 是**裸 JSON Schema**（根级 `required: [...]` 数组合法）。**禁止引入 `defineTool`**：DSL 通道把 `parameters` 当属性映射编译，遇到根级 `required` 数组会在**装载期**抛 `JsonSchemaError`，崩掉整条 loader 装载链。另：宿主**只在注册期校验 `output.schema`**（`assertSupportedJsonSchema`），`parameters` 要到调用期才校验——所以 `parameters` 写错会静默潜行。改动工具 schema 后跑 `node scripts/tools-schema-check.mjs`（全量逐工具校验 + 扫描 `lib/` 零 `defineTool`）与 `node scripts/tools-functional-check.mjs`（mock 服务端 29 项功能断言，仅 loopback 随机端口）。 |
 
 ### 浏览器路由（全部挂在 `webServer` 子 fiber 上）
 
@@ -114,6 +120,8 @@ Agent ──tools──┐
 默认 `$DSH_HOME/data/dsh-comfyui/`（未设则 `~/.dsh/data/dsh-comfyui/`），可用配置 `dataDir` 覆盖：
 
 `workflows.json`（工作流库）、`assets.json`（资产索引）、`current-image.json`（加载区加载位列表，`null` = 空位）、`media-sizes.json`（上传图像素尺寸）、`media-hashes.json`（内容哈希 → 文件名，去重）、`tracked.json`（本插件提交的任务）；另有 `skills/<slug>/` 子目录树（位置可用配置 `skillsDir` 挪到别处）存放各工作流的技能包（`SKILL.md` + `references/` + `scripts/` + `assets/`），由面板编辑、`comfyui_workflow action: skill` 读取。
+
+运行台账与取件产物**不在**数据目录，而在**下载目录**（配置 `downloadDir`，缺省 `<dataDir>/runs/`）：`runs.json`（运行台账，字段见 `ledger.ts`）与 `comfyui_fetch_output` 下载的媒体文件同目录，台账记录里带各文件的绝对路径与体积——这两者必须同目录，否则「这次运行的文件在哪」就要靠猜。
 
 ## 必须遵守的契约（踩过坑）
 

@@ -8,9 +8,9 @@ export const COMFYUI_SKILL = {
   name: 'dsh-comfyui-workflows',
   source: 'runtime',
   description:
-    'ComfyUI 工作流管理：区分“图工作流”（ComfyUI 端保存的画布，衍生主题）与“API 工作流”（可执行，运行主题），分析画布中的多个独立流程（连通分量），以及图→API 提取的规则与面板操作引导。也包含本机环境（用户 ComfyUI 目录）与 TTS-Audio-Suite 音色库的快速查询/快照刷新方案。处理 comfyui_workflow、需要定位用户 ComfyUI 文件/音色库，或用户要求运行 ComfyUI 端保存的工作流时加载。',
+    'ComfyUI 工作流管理：区分“图工作流”（ComfyUI 端保存的画布，衍生主题）与“API 工作流”（可执行，运行主题），分析画布中的多个独立流程（连通分量），以及图→API 提取的规则与面板操作引导。也包含本机环境（用户 ComfyUI 目录）、服务探活（comfyui_probe）、运行台账与取件（runs.json / comfyui_fetch_output）与 TTS-Audio-Suite 音色库的快速查询/快照刷新方案。处理 comfyui_workflow、需要定位用户 ComfyUI 文件/音色库，或用户要求运行 ComfyUI 端保存的工作流时加载。',
   whenToUse:
-    '用户要求运行/管理 ComfyUI 中保存的工作流，或 comfyui_workflow list 显示未提取的图工作流时；需要判断一个画布是否包含多个独立流程、或解释为何某个工作流无法直接运行时；需要查询 TTS-Audio-Suite 音色库、刷新已存工作流的音色参数快照、或定位用户本机 ComfyUI 目录时；或 comfyui_workflow list 里某个工作流带“技能包”标记、需要在运行前读取它时。',
+    '用户要求运行/管理 ComfyUI 中保存的工作流，或 comfyui_workflow list 显示未提取的图工作流时；需要判断一个画布是否包含多个独立流程、或解释为何某个工作流无法直接运行时；需要确认 ComfyUI 是否可用/能加载哪些模型、或运行被提交前预检拒绝（缺模型/节点类型）时；需要按台账复跑（读实际 seed）或把生成结果落盘取件时；需要查询 TTS-Audio-Suite 音色库、刷新已存工作流的音色参数快照、或定位用户本机 ComfyUI 目录时；或 comfyui_workflow list 里某个工作流带“技能包”标记、需要在运行前读取它时。',
   content: `# dsh-comfyui 工作流管理
 
 本插件把 ComfyUI 工作流分成两个主题：
@@ -138,6 +138,7 @@ TTS-Audio-Suite（\`{comfyuiDir}/custom_nodes/tts_audio_suite\`）的"🎭 Chara
 
 ## 运行工作流的正确流程（省 token）
 
+0. **先探活（可选但省事）**：\`comfyui_probe\` 一次拿到服务器就绪性、设备/显存、可加载的 checkpoint 清单与队列积压；服务没起时它返回 \`ready:false\` 加可读错误，**不会抛**——比反复试 run 再猜原因快。
 1. **list 了解**：\`comfyui_workflow list\` 看每个工作流的名称、描述、**标签**（图生图/文生图/文生视频/图生视频/参考生视频/文生音频/参考生音频等，可自定义）和 \`parameters\` 参数清单（含含义 label 和默认值），挑出符合当前场景的工作流。面板上可点标签筛选工作流列表。
 2. **有技能包就先读**：list 里某个工作流带 \`技能包:\` 那一行，说明用户为它写了专属说明书（适用场景、参数怎么填、哪些环节会翻车）。选中它之后、运行之前，先 \`comfyui_workflow action: skill { id }\` 把正文读进来并照着做。标注「运行前必读」的，不读会被 run 直接拒绝。没有这行的工作流跳过本步。
 3. **参数决策**：只依据清单里的参数（键名用英文名），选择/覆盖适合的值——**不需要查看工作流内部结构**。
@@ -145,6 +146,12 @@ TTS-Audio-Suite（\`{comfyuiDir}/custom_nodes/tts_audio_suite\`）的"🎭 Chara
    - **视频/音频工作流一律 \`mode: "async"\`**：生成要几分钟，sync 会等待超时中断（报 generation aborted）。async 立即返回 job id，**启动后不要阻塞等待**（不要对返回的 job 用 wait: true 卡住），继续做其他事，后台任务完成时系统会通知你，到时再用 job_output（不 wait）收集结果和媒体回显。
    - 图片生成可 sync（通常 <1 分钟）；若不确定输出类型，也用 async。
 - \`action: get\` 只在**诊断/检查**工作流内容时使用（它会输出完整 JSON、占用大量 token），它**不是运行路径**。
+
+## 运行之后：台账与取件
+
+- **运行台账**：\`comfyui_run\` 与 \`comfyui_workflow run\` 每次都会写一条记录到**下载目录**下的 \`runs.json\`（配置 \`downloadDir\`，缺省 \`<数据目录>/runs/\`）。身份键是 \`runLabel\`（形如 \`<批次>-<lane>-<job>\`；不传则按 \`<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>\` 自动递增），提交时先落 \`queued\`、到终态**同键覆盖**同一行。**要复跑先看这条记录上的 \`seed\`**（写进图内所有 seed 输入的实际值，不是 -1、也不是随机标记）。
+- **提交前预检会拒绝**：节点类型没注册、或加载器要的模型不在服务端清单里（如 \`ckpt_name\` 不存在），run 会直接返回 \`code: PREFLIGHT\` 的结构化错误并列出缺失值与可用值——**不会提交、不会自动下载模型**。这是「模型没装」而不是「参数填错」，处理方式是把缺失值告诉用户让他装好，别去改参数硬试。
+- **取件落盘**：run 返回的媒体 URL 指向 ComfyUI 的输出目录，文件被移走或 history 被清就失效。要一份本机副本用 \`comfyui_fetch_output\`——按 \`promptId\`（该 prompt 的全部输出）或 \`filename\`+\`subfolder\`+\`type\`（单文件，二选一），落到下载目录内，同名文件自动加 \`.01\` 序号不覆盖，并把绝对路径与体积回填到那条运行记录上。
 
 ## 面板操作引导（转告用户）
 
