@@ -322,16 +322,20 @@ function seedSlotsOf(workflow: Record<string, { class_type: string; inputs: Reco
 /**
  * Write down the actual value of every seed-typed input before submitting.
  *
- * ComfyUI runs whatever seed the graph carries, so a template shipping
- * `seed: 0` reproduces one image forever while a `-1` would leave the value to
- * server-side randomness — neither is replayable after the fact. Resolution
- * happens here, in the implementation, and the result goes into the ledger:
+ * ComfyUI runs whatever seed the graph carries, so a workflow shipping a fixed
+ * authored seed (the built-in templates default to `0`) reproduces one image
+ * forever while `-1` leaves the value to server-side randomness — neither is
+ * replayable after the fact. Resolution happens here, in the implementation,
+ * and the result goes into the ledger, in this order:
  *
- * 1. a node input set to a concrete seed (`>= 0`), or the call's `seed`
- *    parameter, is used verbatim — an explicit choice is never overridden;
- * 2. otherwise one seed is drawn and written into *every* seed input that
- *    shared the same authored value, so a txt2img graph's sampler seed and any
- *    sibling seed still replay from a single recorded number.
+ * 1. the call's `seed` argument, when given — an explicit request wins over the
+ *    graph's authored value, which is what makes `comfyui_run({ seed })` and
+ *    `comfyui_run({ inputs: { "3": { seed } } })` behave the same way;
+ * 2. otherwise the authored value, when it is a concrete seed (`>= 0` and not
+ *    the `-1` "randomize" sentinel);
+ * 3. otherwise one seed is drawn, and written into every seed input that
+ *    shared the same authored value, so a graph's sampler and any sibling seed
+ *    still replay from a single recorded number.
  */
 function resolveSeeds(
   workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>,
@@ -348,11 +352,7 @@ function resolveSeeds(
   const seeds: Record<string, number> = {}
   let primary: number | null = null
   for (const [authored, group] of byAuthored) {
-    // A concrete authored value is itself the resolved value; 0 counts as
-    // concrete (it is a real seed, not a placeholder) — only the special
-    // values ComfyUI reads as "randomize" fall through to a drawn seed.
-    const explicit = authored >= 0 && authored !== -1
-    const value = explicit ? authored : requested ?? Math.floor(Math.random() * 2 ** 32)
+    const value = requested ?? (authored >= 0 && authored !== -1 ? authored : Math.floor(Math.random() * 2 ** 32))
     for (const slot of group) {
       workflow[slot.nodeId]!.inputs[slot.inputKey] = value
       seeds[`${slot.nodeId}.${slot.inputKey}`] = value
@@ -555,19 +555,23 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
+      // Closed deliberately: the host does not validate `parameters` at
+      // register time, so a misspelled argument is only caught if the schema
+      // refuses it. Without this the call silently runs with the field ignored.
+      additionalProperties: false,
       properties: {
-        workflow: { type: 'object', description: 'ComfyUI API-format workflow: node id → { class_type, inputs }. Alternative to `template`.' },
+        workflow: { type: 'object', additionalProperties: true, description: 'ComfyUI API-format workflow: node id → { class_type, inputs }. Alternative to `template`.' },
         template: { type: 'string', enum: ['txt2img', 'img2img', 'video'], description: 'Built-in workflow template id. Alternative to `workflow`.' },
-        inputs: { type: 'object', description: 'Per-node input overrides keyed by node id, e.g. {"3": {"seed": 42, "steps": 30}, "6": {"text": "prompt"}}.' },
+        inputs: { type: 'object', additionalProperties: true, description: 'Per-node input overrides keyed by node id, e.g. {"3": {"seed": 42, "steps": 30}, "6": {"text": "prompt"}}.' },
         mode: { type: 'string', enum: ['sync', 'async'], default: 'sync', description: 'sync waits and returns media; async returns a background job id.' },
         timeout_ms: { type: 'number', minimum: 5_000, maximum: 3_600_000, description: 'Generation wait budget in ms (default 180000). Video needs minutes.' },
-        seed: { type: 'integer', description: 'One concrete sampling seed for this run, written into every seed input the graph carries and recorded in the ledger (reproducible replay). A seed set in the workflow or in `inputs` keeps its own value.' },
+        seed: { type: 'integer', description: 'One concrete sampling seed for this run, written into every seed input the graph carries and recorded in the ledger (reproducible replay). Explicit here it wins over the graph\'s authored value; omitted, the authored value is kept (the built-in templates default to 0, so pass a seed to vary the result).' },
         run_label: { type: 'string', description: 'Governance identity of this run (`<批次>-<lane>-<job>`), used as the ledger key; default `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>` with the sequence drawn from the ledger.' },
       },
       required: [],
     },
     output: {
-      schema: { type: 'object' },
+      schema: { type: 'object', additionalProperties: true },
       render: renderRunResult,
       presentationMeta(_args, value) {
         const result = value as RunResult | BackgroundResult
@@ -781,13 +785,17 @@ function objectInfoDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     description: 'List the node definitions the configured ComfyUI server supports (class types, required and optional inputs). Use it to build valid API-format workflows for comfyui_run. Optional `filter` narrows by class-name substring, e.g. "KSampler", "VAE", "LoadImage".',
     parameters: {
       type: 'object',
+      // Closed deliberately: the host does not validate `parameters` at
+      // register time, so a misspelled argument is only caught if the schema
+      // refuses it. Without this the call silently runs with the field ignored.
+      additionalProperties: false,
       properties: {
         filter: { type: 'string', description: 'Optional substring filter on node class names.' },
       },
       required: [],
     },
     output: {
-      schema: { type: 'object' },
+      schema: { type: 'object', additionalProperties: true },
       render(_args, value) {
         const data = value as { total: number; shown: number; nodes: Array<{ class_type: string; display_name?: string; description?: string }>; hint?: string }
         const lines = [`ComfyUI nodes: ${data.total} total, showing ${data.shown}`]
@@ -843,6 +851,10 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
     ].join(' '),
     parameters: {
       type: 'object',
+      // Closed deliberately: the host does not validate `parameters` at
+      // register time, so a misspelled argument is only caught if the schema
+      // refuses it. Without this the call silently runs with the field ignored.
+      additionalProperties: false,
       properties: {
         action: { type: 'string', enum: ['list', 'run', 'get', 'refresh'], description: 'list returns the workflow library; run executes one workflow by id (direct call to the saved JSON); get returns one workflow\'s full JSON for inspection; refresh re-derives one workflow\'s parameter snapshot from the current node definitions and saves it back.' },
         id: { type: 'string', description: 'Workflow id (required for action: run and get).' },
@@ -851,13 +863,14 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
         run_label: { type: 'string', description: 'Governance identity for this run (`<批次>-<lane>-<job>`), used as the run-ledger key; default `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>`.' },
         parameters: {
           type: 'object',
+          additionalProperties: true,
           description: 'Optional per-run values for the workflow\'s adjustable parameters (see the workflow\'s `inputs` note from action: list — e.g. {"prompt": "a red cat", "seed": 42}). Omitted parameters keep their defaults; seed-type parameters randomize when the workflow marks them 随机.',
         },
       },
       required: ['action'],
     },
     output: {
-      schema: { type: 'object' },
+      schema: { type: 'object', additionalProperties: true },
       render(_args, value) {
         const data = value as {
           action: string
@@ -1271,6 +1284,10 @@ function skillDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
+      // Closed deliberately: the host does not validate `parameters` at
+      // register time, so a misspelled argument is only caught if the schema
+      // refuses it. Without this the call silently runs with the field ignored.
+      additionalProperties: false,
       properties: {
         action: {
           type: 'string',
@@ -1288,7 +1305,7 @@ function skillDefinition(runtime: ComfyUIRuntime): ToolDefinition {
       required: ['action', 'workflow_id'],
     },
     output: {
-      schema: { type: 'object' },
+      schema: { type: 'object', additionalProperties: true },
       render(_args, value) {
         const data = value as {
           action: string
@@ -1482,6 +1499,10 @@ function probeDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
+      // Closed deliberately: the host does not validate `parameters` at
+      // register time, so a misspelled argument is only caught if the schema
+      // refuses it. Without this the call silently runs with the field ignored.
+      additionalProperties: false,
       properties: {
         host: { type: 'string', description: 'Override the target host (default: the configured ComfyUI server).' },
         port: { type: 'integer', description: 'Override the target port (default: the configured ComfyUI server, 8188).' },
@@ -1618,6 +1639,10 @@ function fetchOutputDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
+      // Closed deliberately: the host does not validate `parameters` at
+      // register time, so a misspelled argument is only caught if the schema
+      // refuses it. Without this the call silently runs with the field ignored.
+      additionalProperties: false,
       properties: {
         promptId: { type: 'string', description: 'Download every output of this prompt (from GET /history/<promptId>). Alternative to `filename`.' },
         filename: { type: 'string', description: 'Download this one file. Alternative to `promptId`; pair it with `subfolder`/`type` when the file is not at the output root.' },
