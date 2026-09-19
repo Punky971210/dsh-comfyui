@@ -53,8 +53,8 @@
     "fflate": "^0.8.3"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-settings": "^0.1.2-alpha.4"
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-settings": "*"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

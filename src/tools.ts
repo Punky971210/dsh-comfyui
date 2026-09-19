@@ -6,8 +6,10 @@
  * workflows from the panel-managed workflow library.
  */
 import type { Context } from '@deepseek-ai/cordis'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { resolve as resolvePath, join } from 'node:path'
 import type { Config } from './config.js'
-import { ComfyUIClient, collectMedia } from './comfyui.js'
+import { ComfyUIClient, ComfyUIError, collectMedia, type ComfyUIHistoryEntry } from './comfyui.js'
 import { TEMPLATES, findTemplate, cloneWorkflow, applyTemplateInputs } from './templates.js'
 import type { AssetRecord, LoadSlot, StoredWorkflow } from './store.js'
 import type { GraphAnalysis } from './analyze.js'
@@ -16,6 +18,22 @@ import type { QueuedRun } from './queue.js'
 import { refreshParameterMetadata, type Workflow, type WorkflowParameter } from './params.js'
 import type { HostHint } from './host-hint.js'
 import { SKILL_MAIN, joinFrontmatter, type WorkflowSkillPacks } from './skillpack.js'
+import {
+  formatRunLabel,
+  nextJobNumber,
+  resolveRunPrefix,
+  safeRelativePath,
+  uniqueOutputPath,
+  upsertRun,
+  type LedgerRecord,
+} from './ledger.js'
+import {
+  extractNodeErrors,
+  preflightFailure,
+  preflightUnavailable,
+  preflightWorkflow,
+  type RunFailure,
+} from './preflight.js'
 
 /** A workflow saved on the ComfyUI server (userdata/workflows), with extract status. */
 export interface ComfyUIComfyWorkflow {
@@ -36,6 +54,9 @@ export interface ComfyUIRuntime {
   createClient(apiKey: string | undefined): ComfyUIClient
   /** Absolute media proxy URL base: explicit config > detected request host > loopback. */
   proxyBase(): string | undefined
+  /** Directory the run ledger (`runs.json`) and fetched media land in:
+   * explicit config, else the plugin data directory. */
+  downloadDir(): string
   /** Remembers the origin browsers use to reach this server (Host header). */
   hostHint: HostHint
   /** Whether the settings service can persist config writes. */
@@ -158,10 +179,20 @@ export interface RunMediaItem {
 export interface RunResult {
   kind: 'sync'
   promptId: string
-  status: 'completed' | 'interrupted'
+  /** Governance key of this run (`<批次>-<lane>-<job>`); the ledger row's key. */
+  runLabel: string
+  status: 'completed' | 'interrupted' | 'error'
   elapsedMs: number
   media: RunMediaItem[]
   summary: string
+  /** Seed actually written into the submitted workflow (never -1, never null). */
+  seed: number | null
+  /** Every seed-typed input of the submitted workflow, by `nodeId.inputKey`. */
+  seeds: Record<string, number> | null
+  /** Terminal records are mirrored into the ledger for replay. */
+  ledger: string | null
+  /** Present when the run was refused or failed before/while executing. */
+  error: RunFailure | null
 }
 
 /** Background mode result: collect later with job_output. */
@@ -169,7 +200,13 @@ export interface BackgroundResult {
   kind: 'background'
   jobId: string
   promptId: string
+  /** Governance key of this run, matching its ledger row. */
+  runLabel: string
   label: string
+  /** Seed written into the submitted graph (already resolved, not deferred). */
+  seed: number | null
+  /** Directory holding the run ledger. */
+  ledger: string
 }
 
 /** A minimal ToolDefinition for ctx.tools.register. */
@@ -257,6 +294,90 @@ function summarizeMedia(media: RunMediaItem[]): string {
   return parts.join(', ')
 }
 
+/** A node input name that carries a sampling seed (`seed`, `noise_seed`, …). */
+function isSeedKey(key: string): boolean {
+  return /seed/i.test(key)
+}
+
+/** One seed-typed input found in a workflow. */
+interface SeedSlot {
+  nodeId: string
+  inputKey: string
+  /** The value the workflow carried before resolution. */
+  authored: number
+}
+
+function seedSlotsOf(workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>): SeedSlot[] {
+  const slots: SeedSlot[] = []
+  for (const [nodeId, node] of Object.entries(workflow)) {
+    for (const [inputKey, value] of Object.entries(node.inputs ?? {})) {
+      if (!isSeedKey(inputKey)) continue
+      if (typeof value !== 'number' || !Number.isFinite(value)) continue
+      slots.push({ nodeId, inputKey, authored: value })
+    }
+  }
+  return slots
+}
+
+/**
+ * Write down the actual value of every seed-typed input before submitting.
+ *
+ * ComfyUI runs whatever seed the graph carries, so a template shipping
+ * `seed: 0` reproduces one image forever while a `-1` would leave the value to
+ * server-side randomness — neither is replayable after the fact. Resolution
+ * happens here, in the implementation, and the result goes into the ledger:
+ *
+ * 1. a node input set to a concrete seed (`>= 0`), or the call's `seed`
+ *    parameter, is used verbatim — an explicit choice is never overridden;
+ * 2. otherwise one seed is drawn and written into *every* seed input that
+ *    shared the same authored value, so a txt2img graph's sampler seed and any
+ *    sibling seed still replay from a single recorded number.
+ */
+function resolveSeeds(
+  workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>,
+  requested: number | undefined,
+): { seed: number | null; seeds: Record<string, number> } {
+  const slots = seedSlotsOf(workflow)
+  if (slots.length === 0) return { seed: null, seeds: {} }
+  const byAuthored = new Map<number, SeedSlot[]>()
+  for (const slot of slots) {
+    const group = byAuthored.get(slot.authored)
+    if (group === undefined) byAuthored.set(slot.authored, [slot])
+    else group.push(slot)
+  }
+  const seeds: Record<string, number> = {}
+  let primary: number | null = null
+  for (const [authored, group] of byAuthored) {
+    // A concrete authored value is itself the resolved value; 0 counts as
+    // concrete (it is a real seed, not a placeholder) — only the special
+    // values ComfyUI reads as "randomize" fall through to a drawn seed.
+    const explicit = authored >= 0 && authored !== -1
+    const value = explicit ? authored : requested ?? Math.floor(Math.random() * 2 ** 32)
+    for (const slot of group) {
+      workflow[slot.nodeId]!.inputs[slot.inputKey] = value
+      seeds[`${slot.nodeId}.${slot.inputKey}`] = value
+    }
+    if (primary === null) primary = value
+  }
+  return { seed: primary, seeds }
+}
+
+/** The `filename_prefix` node inputs of a workflow, for the run's output naming. */
+function filenamePrefixes(workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>): string[] {
+  const prefixes: string[] = []
+  for (const node of Object.values(workflow)) {
+    const value = node.inputs?.['filename_prefix']
+    if (typeof value === 'string' && value !== '') prefixes.push(value)
+  }
+  return prefixes
+}
+
+/** Media refs of a completed run, reduced to the ledger's file shape. */
+function ledgerFiles(media: RunMediaItem[]): LedgerRecord['media'] {
+  return media.map(({ filename, subfolder, type }) => ({ filename, subfolder, type }))
+}
+
+/** Render one run result: status line, seed, media, then any failure detail. */
 function renderRunResult(_args: unknown, value: unknown): unknown[] {
   const result = value as RunResult | BackgroundResult
   if (result.kind === 'background') {
@@ -266,27 +387,55 @@ function renderRunResult(_args: unknown, value: unknown): unknown[] {
     }]
   }
   const lines = [
-    `ComfyUI ${result.status} (prompt ${result.promptId}) in ${result.elapsedMs} ms — ${summarizeMedia(result.media)}`,
+    `ComfyUI ${result.status} (prompt ${result.promptId}, run ${result.runLabel}) in ${result.elapsedMs} ms — ${summarizeMedia(result.media)}`,
   ]
+  if (result.error !== null) {
+    lines.push(`  error ${result.error.code}: ${result.error.message}`)
+    for (const node of result.error.nodeErrors ?? []) {
+      lines.push(`    node ${node.node} (${node.classType}).${node.input}: ${node.reason}`)
+    }
+  }
+  if (result.seed !== null) {
+    const distinct = [...new Set(Object.values(result.seeds ?? {}))]
+    lines.push(`  seed: ${result.seed}${distinct.length > 1 ? ` (${JSON.stringify(result.seeds)})` : ''} — 已写入台账，可复跑`)
+  }
   for (const item of result.media) {
     lines.push(`  ${item.kind}: ${item.url}`)
   }
+  if (result.ledger !== null) lines.push(`  台账: ${result.ledger}`)
   return [{ type: 'text', text: lines.join('\n') }]
 }
 
 /**
- * Wait for a queued prompt and collect its media. Untracks the prompt when
- * the wait fails; an interrupted wait reports an interrupted result instead
- * of throwing.
+ * Text of the first seed-keyed exception ComfyUI reported, so a failed run
+ * still explains itself in one line.
  */
-async function waitSync(
+function firstErrorText(errors: RunFailure['nodeErrors']): string {
+  const first = errors?.[0]
+  if (first === undefined) return 'unknown error'
+  return `${first.classType !== '' ? `${first.classType} ` : ''}${first.reason}`
+}
+
+/**
+ * Wait for a submitted prompt, then record its terminal state **in the same
+ * ledger row** the queued record opened (identity key first, promptId second)
+ * and hand the collected media to `onTerminal`.
+ *
+ * The terminal record reuses the whole queued snapshot, so a replay reads the
+ * seed and params that were actually submitted rather than the workflow as
+ * authored.
+ */
+async function waitAndRecord(
   runtime: ComfyUIRuntime,
   client: ComfyUIClient,
   promptId: string,
   config: Config,
   signal: AbortSignal,
-  timeoutMs?: number,
-): Promise<RunResult> {
+  timeoutMs: number | undefined,
+  record: LedgerRecord,
+  runDir: string,
+  onTerminal: (state: { status: RunResult['status']; media: RunMediaItem[]; durationMs: number; errors: RunFailure['nodeErrors'] }) => void,
+): Promise<ComfyUIHistoryEntry | undefined> {
   const startedAt = Date.now()
   try {
     const entry = await client.waitForCompletion({
@@ -295,28 +444,98 @@ async function waitSync(
       pollIntervalMs: config.pollIntervalMs,
       signal,
     })
-    const items = collectMedia({ promptId, entry, maxItems: config.maxMediaItems, proxyBase: runtime.proxyBase() })
-    return {
-      kind: 'sync',
-      promptId,
-      status: 'completed',
-      elapsedMs: Date.now() - startedAt,
-      media: items,
-      summary: summarizeMedia(items),
-    }
+    const media = collectMedia({ promptId, entry, maxItems: config.maxMediaItems, proxyBase: runtime.proxyBase() })
+    const durationMs = Date.now() - startedAt
+    upsertRun(runDir, { ...record, promptId, status: 'completed', durationMs, media: ledgerFiles(media) })
+    onTerminal({ status: 'completed', media, durationMs, errors: null })
+    return entry
   } catch (error) {
     runtime.untrack(promptId)
+    const durationMs = Date.now() - startedAt
     if (error instanceof Error && error.name === 'ComfyUIError' && error.message.includes('interrupted')) {
-      return {
-        kind: 'sync',
-        promptId,
-        status: 'interrupted',
-        elapsedMs: Date.now() - startedAt,
-        media: [],
-        summary: 'interrupted before completion',
-      }
+      upsertRun(runDir, { ...record, promptId, status: 'interrupted', durationMs })
+      onTerminal({ status: 'interrupted', media: [], durationMs, errors: null })
+      return undefined
     }
-    throw error
+    // A failed run is a terminal state too: the row is closed out with the
+    // node-level detail ComfyUI reported, so it is not left reading "queued".
+    const entry = await client.getHistory(promptId).catch(() => undefined)
+    const errors = extractNodeErrors(entry)
+    const failure: RunFailure = {
+      code: 'EXECUTION_FAILED',
+      message: firstErrorText(errors) || (error instanceof Error ? error.message : String(error)),
+      nodeErrors: errors,
+    }
+    upsertRun(runDir, { ...record, promptId, status: 'failed', durationMs, error: failure })
+    onTerminal({ status: 'error', media: [], durationMs, errors })
+    return entry
+  }
+}
+
+/**
+ * The run identity both `comfyui_run` and `comfyui_workflow action: run` open
+ * their ledger row with: the governance key, the directory the ledger lives in,
+ * and the sequence number when one had to be drawn.
+ */
+function beginRun(
+  runtime: ComfyUIRuntime,
+  requestedLabel: unknown,
+): { runDir: string; runLabel: string; requested: string; job: number } {
+  const runDir = runtime.downloadDir()
+  const requested = typeof requestedLabel === 'string' && requestedLabel.trim() !== ''
+    ? requestedLabel.trim()
+    : resolveRunPrefix()
+  // An explicit label ending in digits is already a sequence; anything else is
+  // a prefix and gets the next number this ledger has not used.
+  if (/-\d+$/.test(requested)) return { runDir, runLabel: requested, requested, job: 0 }
+  const job = nextJobNumber(runDir, requested)
+  return { runDir, runLabel: formatRunLabel(requested, job), requested, job }
+}
+
+/** A run result with no terminal state yet (used for the refused paths). */
+function emptyResult(runLabel: string, runDir: string, failure: RunFailure): RunResult {
+  return {
+    kind: 'sync',
+    promptId: runLabel,
+    runLabel,
+    status: 'error',
+    elapsedMs: 0,
+    media: [],
+    summary: 'not submitted',
+    seed: null,
+    seeds: null,
+    ledger: runDir,
+    error: failure,
+  }
+}
+
+/**
+ * A run that never reached the server: the refusal (or the failed submit) is
+ * its own ledger row, so "what did this run key try to do" stays answerable.
+ */
+function refusedRun(
+  runLabel: string,
+  runDir: string,
+  params: Record<string, unknown>,
+  failure: RunFailure,
+  seed: number | null,
+  seeds: Record<string, number>,
+): RunResult {
+  upsertRun(runDir, {
+    runLabel,
+    seed: seed ?? undefined,
+    seeds,
+    params,
+    ts: new Date().toISOString(),
+    status: 'failed',
+    durationMs: 0,
+    error: failure,
+  })
+  const result = emptyResult(runLabel, runDir, failure)
+  return {
+    ...result,
+    seed,
+    seeds: Object.keys(seeds).length > 0 ? seeds : null,
   }
 }
 
@@ -329,6 +548,9 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
       'Use `inputs` to override node inputs by id, e.g. {"6": {"text": "a red cat"}} for the positive prompt in the templates.',
       'Templates: txt2img — 4 checkpoint, 5 EmptyLatentImage (width/height), 6 positive text, 7 negative text, 3 KSampler (seed/steps/cfg/denoise), 9 SaveImage. img2img — 10 LoadImage (image), 11 VAEEncode, 6 text, 3 KSampler (denoise). video — Wan 2.1, needs ComfyUI-WanVideoWrapper custom nodes (10 UNETLoader, 13 WanTextEncode, 14 WanImageToVideo, 15 KSampler, 17 SaveVideo).',
       'Inspect available node types with comfyui_object_info before hand-writing a workflow.',
+      'Before anything is submitted the workflow is preflighted against the server node definitions: an unregistered class type, or a loader naming a model that is not on disk, refuses the run with a structured error listing the missing items and the values that ARE available. Nothing is ever downloaded to satisfy a missing model.',
+      '`seed` writes one concrete sampling seed into every seed input the graph carries and records it in the run ledger, so a run is reproducible afterwards; a seed already present in the workflow (or passed through `inputs`) is kept as-is. `run_label` fixes the run identity (`<批次>-<lane>-<job>`, default `<prefix>-<NNNN>`); it is the ledger key, and `queued` records are overwritten in place by the terminal state.',
+      'Every run is recorded in `<downloadDir>/runs.json` with its runLabel, resolved seeds, status and media; comfyui_fetch_output downloads those files to disk.',
       '`mode: sync` (default) waits and returns media URLs; `mode: async` starts a background job and returns a job id for job_output.',
     ].join(' '),
     parameters: {
@@ -339,6 +561,8 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
         inputs: { type: 'object', description: 'Per-node input overrides keyed by node id, e.g. {"3": {"seed": 42, "steps": 30}, "6": {"text": "prompt"}}.' },
         mode: { type: 'string', enum: ['sync', 'async'], default: 'sync', description: 'sync waits and returns media; async returns a background job id.' },
         timeout_ms: { type: 'number', minimum: 5_000, maximum: 3_600_000, description: 'Generation wait budget in ms (default 180000). Video needs minutes.' },
+        seed: { type: 'integer', description: 'One concrete sampling seed for this run, written into every seed input the graph carries and recorded in the ledger (reproducible replay). A seed set in the workflow or in `inputs` keeps its own value.' },
+        run_label: { type: 'string', description: 'Governance identity of this run (`<批次>-<lane>-<job>`), used as the ledger key; default `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>` with the sequence drawn from the ledger.' },
       },
       required: [],
     },
@@ -370,8 +594,80 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
       const apiKey = await runtime.getApiKey()
       const client = runtime.createClient(apiKey)
       const { workflow, label } = buildWorkflow(args)
-      const promptId = await runtime.queue(workflow, { workflowName: label, source: 'tool' })
       const waitMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : config.timeoutMs
+
+      // Governance identity first: the ledger row, the refusal record and the
+      // replay all address this run by the same key.
+      const { runDir, runLabel } = beginRun(runtime, args.run_label)
+      const requestedSeed = typeof args.seed === 'number' && Number.isFinite(args.seed) && args.seed !== -1
+        ? Math.floor(args.seed)
+        : undefined
+      // The ledger stores the run's own settings, not the workflow body: the
+      // graph is addressed by runLabel (and its seed by `seed`), which is what
+      // a replay needs without copying a whole workflow into the bookkeeping.
+      const params: Record<string, unknown> = {
+        ...(typeof args.template === 'string' ? { template: args.template } : {}),
+        ...(typeof args.mode === 'string' ? { mode: args.mode } : {}),
+        ...(typeof args.timeout_ms === 'number' ? { timeout_ms: args.timeout_ms } : {}),
+        node_overrides: args.inputs === undefined ? 0 : Object.keys(args.inputs as Record<string, unknown>).length,
+      }
+
+      // D4 preflight: read object_info, check class types and loader values,
+      // refuse on any gap. Read-only — a missing model is reported, never
+      // downloaded, and nothing is queued.
+      let objectInfo: Record<string, unknown>
+      try {
+        objectInfo = await client.objectInfo()
+      } catch (error) {
+        return refusedRun(runLabel, runDir, params, preflightUnavailable(error instanceof Error ? error.message : String(error)), null, {})
+      }
+      const preflight = preflightWorkflow(workflow, objectInfo)
+      if (!preflight.ok) {
+        return refusedRun(runLabel, runDir, params, preflightFailure(preflight, runDir), null, {})
+      }
+
+      const { seed, seeds } = resolveSeeds(workflow, requestedSeed)
+      const base: LedgerRecord = {
+        runLabel,
+        seed: seed ?? undefined,
+        seeds,
+        params,
+        workflowName: label,
+        ts: new Date().toISOString(),
+        status: 'queued',
+      }
+      // The queued row is opened before the submit, so an interrupt or a crash
+      // between here and the terminal state still leaves the attempt on record.
+      upsertRun(runDir, base)
+
+      const startedAt = Date.now()
+      let promptId: string
+      try {
+        promptId = await runtime.queue(workflow, { workflowName: label, source: 'tool' })
+      } catch (error) {
+        const failure: RunFailure = {
+          code: 'SUBMIT_FAILED',
+          message: error instanceof Error ? error.message : String(error),
+          nodeErrors: null,
+        }
+        upsertRun(runDir, { ...base, status: 'failed', durationMs: Date.now() - startedAt, error: failure })
+        return {
+          kind: 'sync',
+          promptId: runLabel,
+          runLabel,
+          status: 'error',
+          elapsedMs: Date.now() - startedAt,
+          media: [],
+          summary: 'not submitted',
+          seed,
+          seeds: Object.keys(seeds).length > 0 ? seeds : null,
+          ledger: runDir,
+          error: failure,
+        }
+      }
+      // Seed and prefixes are written into the submitted graph before submit,
+      // so the ledger snapshot is the graph's actual values.
+      base.promptId = promptId
 
       if (mode === 'async') {
         const jobs = ctx.get('jobs') as JobsService | undefined
@@ -383,30 +679,37 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
           label,
           ...(exec.agent !== undefined ? { owner: exec.agent } : {}),
           run: () => {
-            const startedAt = Date.now()
+            let terminal: RunResult | undefined
             const done = (async () => {
-              try {
-                const entry = await client.waitForCompletion({
-                  promptId,
-                  timeoutMs: waitMs,
-                  pollIntervalMs: config.pollIntervalMs,
-                  signal: new AbortController().signal,
-                })
-                const items = collectMedia({ promptId, entry, maxItems: config.maxMediaItems, proxyBase: runtime.proxyBase() })
-                const result: RunResult = {
-                  kind: 'sync',
-                  promptId,
-                  status: 'completed',
-                  elapsedMs: Date.now() - startedAt,
-                  media: items,
-                  summary: summarizeMedia(items),
-                }
-                return { status: 'completed' as const, output: JSON.stringify(result) }
-              } catch (error) {
-                runtime.untrack(promptId)
-                const message = error instanceof Error ? error.message : String(error)
-                return { status: 'failed' as const, detail: 'comfyui', output: message }
+              const record = { ...base }
+              await waitAndRecord(
+                runtime, client, promptId, config, new AbortController().signal, waitMs, record, runDir,
+                (state) => {
+                  terminal = {
+                    kind: 'sync',
+                    promptId,
+                    runLabel,
+                    status: state.status,
+                    elapsedMs: state.durationMs,
+                    media: state.media,
+                    summary: summarizeMedia(state.media),
+                    seed,
+                    seeds: Object.keys(seeds).length > 0 ? seeds : null,
+                    ledger: runDir,
+                    error: state.errors === null ? null : {
+                      code: 'EXECUTION_FAILED',
+                      message: firstErrorText(state.errors),
+                      nodeErrors: state.errors,
+                    },
+                  }
+                },
+              )
+              if (terminal === undefined) {
+                return { status: 'failed' as const, detail: 'comfyui', output: `run ${runLabel} produced no terminal state` }
               }
+              return terminal.status === 'error'
+                ? { status: 'failed' as const, detail: 'comfyui', output: JSON.stringify(terminal) }
+                : { status: 'completed' as const, output: JSON.stringify(terminal) }
             })()
             return {
               cancel: () => { void client.interrupt().catch(() => undefined) },
@@ -414,12 +717,30 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
             }
           },
         })
-        const result: BackgroundResult = { kind: 'background', jobId, promptId, label }
+        const result: BackgroundResult = { kind: 'background', jobId, promptId, runLabel, label, seed, ledger: runDir }
         return result
       }
 
-      const result = await waitSync(runtime, client, promptId, config, exec.signal, waitMs)
-      return result
+      let outcome: { status: RunResult['status']; media: RunMediaItem[]; durationMs: number; errors: RunFailure['nodeErrors'] } | undefined
+      await waitAndRecord(runtime, client, promptId, config, exec.signal, waitMs, base, runDir, (state) => { outcome = state })
+      const terminal = outcome ?? { status: 'error' as const, media: [], durationMs: Date.now() - startedAt, errors: null }
+      return {
+        kind: 'sync',
+        promptId,
+        runLabel,
+        status: terminal.status,
+        elapsedMs: terminal.durationMs,
+        media: terminal.media,
+        summary: summarizeMedia(terminal.media),
+        seed,
+        seeds: Object.keys(seeds).length > 0 ? seeds : null,
+        ledger: runDir,
+        error: terminal.errors === null && terminal.status !== 'error' ? null : {
+          code: 'EXECUTION_FAILED',
+          message: firstErrorText(terminal.errors) || (terminal.status === 'interrupted' ? 'interrupted before completion' : 'unknown error'),
+          nodeErrors: terminal.errors,
+        },
+      }
     },
   }
 }
@@ -527,6 +848,7 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
         id: { type: 'string', description: 'Workflow id (required for action: run and get).' },
         mode: { type: 'string', enum: ['sync', 'async'], description: 'run mode (default sync); async starts a background job and returns its id for job_output. Video/audio workflows should use async — generation takes minutes and sync may time out.' },
         timeout_ms: { type: 'number', minimum: 5_000, maximum: 3_600_000, description: 'Generation wait budget in ms (default 900000 = 15 min). Video needs minutes; raise this for long videos.' },
+        run_label: { type: 'string', description: 'Governance identity for this run (`<批次>-<lane>-<job>`), used as the run-ledger key; default `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>`.' },
         parameters: {
           type: 'object',
           description: 'Optional per-run values for the workflow\'s adjustable parameters (see the workflow\'s `inputs` note from action: list — e.g. {"prompt": "a red cat", "seed": 42}). Omitted parameters keep their defaults; seed-type parameters randomize when the workflow marks them 随机.',
@@ -546,10 +868,12 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
           result?: RunResult
           id?: string
           name?: string
+          workflowName?: string
           workflow?: unknown
           background?: BackgroundResult
           changed?: string[]
           parameterCount?: number
+          error?: RunFailure | null
           skill?: { workflowName: string; summary: string; body: string; resourceBase: string; files: string[] }
         }
         if (data.action === 'skill') {
@@ -637,9 +961,17 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
           return [{ type: 'text', text: lines.join('\n') }]
         }
         const result = data.result
-        if (result === undefined) return [{ type: 'text', text: 'ComfyUI workflow run returned no result.' }]
-        const lines = [`ComfyUI workflow ${result.status} (prompt ${result.promptId}) in ${result.elapsedMs} ms — ${summarizeMedia(result.media)}`]
+        if (result === undefined) {
+          if (data.error !== undefined && data.error !== null) {
+            return [{ type: 'text', text: `ComfyUI workflow ${data.workflowName ?? data.id} 未提交: ${data.error.code} ${data.error.message}` }]
+          }
+          return [{ type: 'text', text: 'ComfyUI workflow run returned no result.' }]
+        }
+        const lines = [`ComfyUI workflow ${result.status} (prompt ${result.promptId}, run ${result.runLabel}) in ${result.elapsedMs} ms — ${summarizeMedia(result.media)}`]
+        if (result.error !== null) lines.push(`  error ${result.error.code}: ${result.error.message}`)
+        if (result.seed !== null) lines.push(`  seed: ${result.seed} — 已写入台账，可复跑`)
         for (const item of result.media) lines.push(`  ${item.kind}: ${item.url}`)
+        if (result.ledger !== null) lines.push(`  台账: ${result.ledger}`)
         return [{ type: 'text', text: lines.join('\n') }]
       },
       presentationMeta(_args, value) {
@@ -798,18 +1130,44 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
       const values = typeof args.parameters === 'object' && args.parameters !== null
         ? (args.parameters as Record<string, unknown>)
         : {}
-      const promptId = await runtime.queue(saved.workflow, {
-        workflowName: saved.name,
-        workflowId: saved.id,
-        source: 'workflow-tool',
-        parameters: saved.parameters,
-        values,
-      })
+      // The run identity is the same governance key comfyui_run uses, and it is
+      // what makes this path land on the ledger instead of only in history.
+      const { runDir, runLabel } = beginRun(runtime, args.run_label)
       const mode = args.mode === undefined ? 'sync' : args.mode
       if (mode !== 'sync' && mode !== 'async') {
         throw new Error(`comfyui_workflow: mode must be sync or async, got ${String(mode)}`)
       }
       const waitMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : config.timeoutMs
+      const base: LedgerRecord = {
+        runLabel,
+        params: { workflowId: saved.id, workflowName: saved.name, values },
+        workflowName: saved.name,
+        ts: new Date().toISOString(),
+        status: 'queued',
+      }
+      upsertRun(runDir, base)
+
+      const startedAt = Date.now()
+      let promptId: string
+      try {
+        promptId = await runtime.queue(saved.workflow, {
+          workflowName: saved.name,
+          workflowId: saved.id,
+          source: 'workflow-tool',
+          parameters: saved.parameters,
+          values,
+        })
+      } catch (error) {
+        const failure: RunFailure = {
+          code: 'SUBMIT_FAILED',
+          message: error instanceof Error ? error.message : String(error),
+          nodeErrors: null,
+        }
+        upsertRun(runDir, { ...base, status: 'failed', durationMs: Date.now() - startedAt, error: failure })
+        return { action: 'run', id, workflowName: saved.name, runLabel, error: failure }
+      }
+      const record: LedgerRecord = { ...base, promptId }
+
       if (mode === 'async') {
         const jobs = ctx.get('jobs') as JobsService | undefined
         if (jobs === undefined) {
@@ -820,30 +1178,36 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
           label: saved.name,
           ...(exec.agent !== undefined ? { owner: exec.agent } : {}),
           run: () => {
-            const startedAt = Date.now()
             const done = (async () => {
-              try {
-                const entry = await client.waitForCompletion({
-                  promptId,
-                  timeoutMs: waitMs,
-                  pollIntervalMs: config.pollIntervalMs,
-                  signal: new AbortController().signal,
-                })
-                const items = collectMedia({ promptId, entry, maxItems: config.maxMediaItems, proxyBase: runtime.proxyBase() })
-                const result: RunResult = {
-                  kind: 'sync',
-                  promptId,
-                  status: 'completed',
-                  elapsedMs: Date.now() - startedAt,
-                  media: items,
-                  summary: summarizeMedia(items),
-                }
-                return { status: 'completed' as const, output: JSON.stringify(result) }
-              } catch (error) {
-                runtime.untrack(promptId)
-                const message = error instanceof Error ? error.message : String(error)
-                return { status: 'failed' as const, detail: 'comfyui', output: message }
+              let terminal: RunResult | undefined
+              await waitAndRecord(
+                runtime, client, promptId, config, new AbortController().signal, waitMs, record, runDir,
+                (state) => {
+                  terminal = {
+                    kind: 'sync',
+                    promptId,
+                    runLabel,
+                    status: state.status,
+                    elapsedMs: state.durationMs,
+                    media: state.media,
+                    summary: summarizeMedia(state.media),
+                    seed: null,
+                    seeds: null,
+                    ledger: runDir,
+                    error: state.errors === null ? null : {
+                      code: 'EXECUTION_FAILED',
+                      message: firstErrorText(state.errors),
+                      nodeErrors: state.errors,
+                    },
+                  }
+                },
+              )
+              if (terminal === undefined) {
+                return { status: 'failed' as const, detail: 'comfyui', output: `run ${runLabel} produced no terminal state` }
               }
+              return terminal.status === 'error'
+                ? { status: 'failed' as const, detail: 'comfyui', output: JSON.stringify(terminal) }
+                : { status: 'completed' as const, output: JSON.stringify(terminal) }
             })()
             return {
               cancel: () => { void client.interrupt().catch(() => undefined) },
@@ -851,10 +1215,30 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
             }
           },
         })
-        return { action: 'run', id, workflowName: saved.name, background: { kind: 'background', jobId, promptId, label: saved.name } }
+        const background: BackgroundResult = { kind: 'background', jobId, promptId, runLabel, label: saved.name, seed: null, ledger: runDir }
+        return { action: 'run', id, workflowName: saved.name, background }
       }
-      const result = await waitSync(runtime, client, promptId, config, exec.signal, waitMs)
-      return { action: 'run', id, workflowName: saved.name, result }
+      let outcome: { status: RunResult['status']; media: RunMediaItem[]; durationMs: number; errors: RunFailure['nodeErrors'] } | undefined
+      await waitAndRecord(runtime, client, promptId, config, exec.signal, waitMs, record, runDir, (state) => { outcome = state })
+      const terminal = outcome ?? { status: 'error' as const, media: [], durationMs: Date.now() - startedAt, errors: null }
+      const result: RunResult = {
+        kind: 'sync',
+        promptId,
+        runLabel,
+        status: terminal.status,
+        elapsedMs: terminal.durationMs,
+        media: terminal.media,
+        summary: summarizeMedia(terminal.media),
+        seed: null,
+        seeds: null,
+        ledger: runDir,
+        error: terminal.errors === null && terminal.status !== 'error' ? null : {
+          code: 'EXECUTION_FAILED',
+          message: firstErrorText(terminal.errors) || (terminal.status === 'interrupted' ? 'interrupted before completion' : 'unknown error'),
+          nodeErrors: terminal.errors,
+        },
+      }
+      return { action: 'run', id, workflowName: saved.name, runLabel, result }
     },
   }
 }
@@ -1037,13 +1421,362 @@ function skillDefinition(runtime: ComfyUIRuntime): ToolDefinition {
   }
 }
 
+/** A client pointed at the run's configured server or an explicit override. */
+function clientFor(
+  runtime: ComfyUIRuntime,
+  apiKey: string | undefined,
+  override: { host?: unknown; port?: unknown; timeoutMs?: unknown },
+): ComfyUIClient {
+  const config = runtime.getConfig()
+  const host = typeof override.host === 'string' && override.host !== '' ? override.host : undefined
+  const port = typeof override.port === 'number' && Number.isFinite(override.port) ? Math.floor(override.port) : undefined
+  const baseUrl = host === undefined && port === undefined
+    ? config.baseUrl
+    : `http://${host ?? '127.0.0.1'}:${port ?? 8188}`
+  const connectTimeoutMs = typeof override.timeoutMs === 'number' && Number.isFinite(override.timeoutMs)
+    ? Math.max(1, Math.floor(override.timeoutMs))
+    : config.connectTimeoutMs
+  return new ComfyUIClient(baseUrl, apiKey, connectTimeoutMs, config.maxMediaBytes)
+}
+
+/** The declared `ckpt_name` values of the server, or null when undeclared. */
+function checkpointNames(objectInfo: Record<string, unknown>): string[] | null {
+  const definition = objectInfo['CheckpointLoaderSimple'] as { input?: { required?: Record<string, unknown> } } | undefined
+  const spec = definition?.input?.required?.['ckpt_name']
+  if (!Array.isArray(spec) || !Array.isArray(spec[0])) return null
+  return (spec[0] as unknown[]).filter((value): value is string => typeof value === 'string')
+}
+
+/** The first device row of `/system_stats`, if the server reports one. */
+function firstDevice(stats: unknown): { name: string | null; type: string | null; vramFree: number | null } | null {
+  if (typeof stats !== 'object' || stats === null) return null
+  const devices = (stats as { devices?: unknown }).devices
+  if (!Array.isArray(devices) || devices.length === 0) return null
+  const device = devices[0]
+  if (typeof device !== 'object' || device === null) return null
+  const record = device as Record<string, unknown>
+  return {
+    name: typeof record['name'] === 'string' ? record['name'] : null,
+    type: typeof record['type'] === 'string' ? record['type'] : null,
+    vramFree: typeof record['vram_free'] === 'number' ? record['vram_free'] : null,
+  }
+}
+
+/**
+ * `comfyui_probe`: the capability gate to run before submitting anything.
+ *
+ * One call answers "is the server up, what is it, and can it load the models I
+ * am about to name": readiness from `/system_stats`, the device/VRAM row, the
+ * `CheckpointLoaderSimple` model list, and the queue backlog. An unreachable or
+ * non-ComfyUI server is a normal answer (`ready: false` plus a readable
+ * `{code, message, status}`) rather than a thrown error, so a caller can gate
+ * on it without catching.
+ */
+function probeDefinition(runtime: ComfyUIRuntime): ToolDefinition {
+  return {
+    name: 'comfyui_probe',
+    description: [
+      'Probe the configured ComfyUI server before submitting anything: readiness (/system_stats), device and free VRAM, the checkpoint models the server can actually load (CheckpointLoaderSimple), and the queue backlog.',
+      'Returns structured JSON. A server that is down, wrong, or too old answers `ready: false` with a readable `error` ({code, message, status}) instead of failing.',
+      'Use it as the pre-submit gate: a workflow naming a checkpoint that is not in `ckpts` will be refused by comfyui_run, and this call is how you find that out (and what to tell the user to install) before a run.',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        host: { type: 'string', description: 'Override the target host (default: the configured ComfyUI server).' },
+        port: { type: 'integer', description: 'Override the target port (default: the configured ComfyUI server, 8188).' },
+        timeoutMs: { type: 'integer', description: 'Per-request timeout in ms (default: the configured connectTimeoutMs).' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ready: { type: 'boolean' },
+          comfyVersion: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+          device: {
+            oneOf: [
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  name: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  type: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+                  vramFree: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+                },
+              },
+              { type: 'null' },
+            ],
+          },
+          ckpts: { oneOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }] },
+          queueLength: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+          baseUrl: { type: 'string' },
+          ts: { type: 'string' },
+          error: {
+            oneOf: [
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  code: { type: 'string' },
+                  message: { type: 'string' },
+                  status: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
+                },
+              },
+              { type: 'null' },
+            ],
+          },
+        },
+      },
+      render(_args, value) {
+        const data = value as {
+          ready: boolean
+          comfyVersion: string | null
+          device: { name: string | null; type: string | null; vramFree: number | null } | null
+          ckpts: string[] | null
+          queueLength: number | null
+          baseUrl: string
+          error: { code: string; message: string; status: number | null } | null
+        }
+        if (!data.ready) {
+          return [{ type: 'text', text: `ComfyUI 不可用（${data.baseUrl}）: ${data.error?.code ?? 'ERROR'} ${data.error?.message ?? ''}` }]
+        }
+        const lines = [
+          `ComfyUI ready: ${data.baseUrl}${data.comfyVersion !== null ? ` (v${data.comfyVersion})` : ''}`,
+          `device: ${data.device?.name ?? 'unknown'}${data.device?.type !== null && data.device?.type !== undefined ? ` [${data.device.type}]` : ''}${data.device?.vramFree !== null && data.device?.vramFree !== undefined ? `, vram free ${data.device.vramFree}` : ''}`,
+          `queue: ${data.queueLength ?? 0} task(s)`,
+          `checkpoints (${data.ckpts?.length ?? 0}): ${(data.ckpts ?? []).slice(0, 12).join(', ') || 'none'}`,
+        ]
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: 120_000,
+    async execute(args) {
+      const client = clientFor(runtime, await runtime.getApiKey(), args)
+      const ts = new Date().toISOString()
+      try {
+        const stats = await client.systemStats()
+        const objectInfo = await client.objectInfo()
+        const queue = await client.getQueue()
+        const version = (stats as { system?: { comfyui_version?: unknown } } | undefined)?.system?.comfyui_version
+        return {
+          ready: true,
+          comfyVersion: typeof version === 'string' ? version : null,
+          device: firstDevice(stats),
+          ckpts: checkpointNames(objectInfo),
+          queueLength: queue.queue_running.length + queue.queue_pending.length,
+          baseUrl: client.baseUrl,
+          ts,
+          error: null,
+        }
+      } catch (error) {
+        // An unreachable server is an answer, not an exception: the probe
+        // exists to be run *before* committing to a run.
+        const status = error instanceof ComfyUIError ? error.status ?? null : null
+        return {
+          ready: false,
+          comfyVersion: null,
+          device: null,
+          ckpts: null,
+          queueLength: null,
+          baseUrl: client.baseUrl,
+          ts,
+          error: {
+            code: error instanceof ComfyUIError ? 'UNREACHABLE' : 'ERROR',
+            message: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+            status,
+          },
+        }
+      }
+    },
+  }
+}
+
+/**
+ * `comfyui_fetch_output`: bring a run's media onto this machine.
+ *
+ * `comfyui_run` returns proxy URLs, which serve the media out of ComfyUI's
+ * output directory and stop working the moment that file is moved or the
+ * history entry is cleared. This tool makes a durable local copy instead, named
+ * through `uniqueOutputPath` so a repeated fetch never overwrites an earlier
+ * one, and records the absolute paths on the same ledger row as the run that
+ * produced them.
+ *
+ * Two addressing modes, exactly one of which is required (the pairing cannot
+ * be expressed in the parameters schema — the host's schema subset allows
+ * neither a root `oneOf` beside `properties` nor a conditional — so the
+ * check lives in `execute`, and the description states it).
+ */
+function fetchOutputDefinition(runtime: ComfyUIRuntime): ToolDefinition {
+  return {
+    name: 'comfyui_fetch_output',
+    description: [
+      'Download a completed run\'s media from ComfyUI onto this machine and record the paths in the run ledger.',
+      'Address the media EITHER by `promptId` (every output of that prompt, via GET /history/<promptId>) OR by `filename` (one file, using `subfolder` and `type`); passing both, or neither, is refused.',
+      'Files land in `targetDir` (default: the configured download directory) and never overwrite an existing file — the stem is bumped (`image.png` → `image.01.png`). The absolute paths and sizes are written onto the matching `runs.json` row, so a run and its local copies stay linked.',
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        promptId: { type: 'string', description: 'Download every output of this prompt (from GET /history/<promptId>). Alternative to `filename`.' },
+        filename: { type: 'string', description: 'Download this one file. Alternative to `promptId`; pair it with `subfolder`/`type` when the file is not at the output root.' },
+        subfolder: { type: 'string', description: 'Subfolder the file lives in (default: the output root).' },
+        type: { type: 'string', description: 'ComfyUI file type/context of the file (default: output).' },
+        targetDir: { type: 'string', description: 'Directory to download into (default: the configured download directory).' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          files: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                filename: { type: 'string' },
+                subfolder: { type: 'string' },
+                type: { type: 'string' },
+                absPath: { type: 'string' },
+                size: { type: 'integer' },
+              },
+            },
+          },
+          targetDir: { type: 'string' },
+          promptId: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+          ledger: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              file: { type: 'string' },
+              records: { type: 'integer' },
+              note: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+            },
+          },
+          error: {
+            oneOf: [
+              {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  code: { type: 'string' },
+                  message: { type: 'string' },
+                },
+              },
+              { type: 'null' },
+            ],
+          },
+        },
+      },
+      render(_args, value) {
+        const data = value as {
+          files: Array<{ absPath: string; size: number }>
+          targetDir: string
+          ledger: { file: string; records: number; note: string | null }
+          error: { code: string; message: string } | null
+        }
+        if (data.error !== null) {
+          return [{ type: 'text', text: `comfyui_fetch_output 失败 ${data.error.code}: ${data.error.message}` }]
+        }
+        const lines = [`下载 ${data.files.length} 个文件到 ${data.targetDir}:`]
+        for (const file of data.files) lines.push(`  ${file.absPath} (${file.size} B)`)
+        lines.push(`台账: ${data.ledger.file}（${data.ledger.records} 条${data.ledger.note !== null ? `；${data.ledger.note}` : ''}）`)
+        return [{ type: 'text', text: lines.join('\n') }]
+      },
+    },
+    timeoutMs: 600_000,
+    async execute(args) {
+      const hasPrompt = typeof args.promptId === 'string' && args.promptId !== ''
+      const hasFilename = typeof args.filename === 'string' && args.filename !== ''
+      const runDir = typeof args.targetDir === 'string' && args.targetDir !== ''
+        ? resolvePath(args.targetDir)
+        : runtime.downloadDir()
+      const fail = (code: string, message: string, promptId: string | null): Record<string, unknown> => ({
+        files: [],
+        targetDir: runDir,
+        promptId,
+        ledger: { file: join(runDir, 'runs.json'), records: 0, note: null },
+        error: { code, message },
+      })
+      if (hasPrompt === hasFilename) {
+        return fail('BAD_ARGS', 'promptId 与 filename 二选一：给且仅给一个', null)
+      }
+      const client = runtime.createClient(await runtime.getApiKey())
+
+      let sources: Array<{ filename: string; subfolder: string; type: string }>
+      let promptId: string
+      if (hasPrompt) {
+        promptId = String(args.promptId)
+        const entry = await client.getHistory(promptId)
+        if (entry === undefined) return fail('NO_HISTORY', `history 无记录: ${promptId}（prompt 未提交或已被清除）`, promptId)
+        sources = collectMedia({ promptId, entry, maxItems: Number.MAX_SAFE_INTEGER, proxyBase: undefined })
+          .map(({ filename, subfolder, type }) => ({ filename, subfolder, type }))
+        if (sources.length === 0) return fail('NO_OUTPUTS', `history ${promptId} 无媒体输出`, promptId)
+      } else {
+        const filename = String(args.filename)
+        promptId = `view:${filename}`
+        sources = [{
+          filename,
+          subfolder: typeof args.subfolder === 'string' ? args.subfolder : '',
+          type: typeof args.type === 'string' ? args.type : 'output',
+        }]
+      }
+
+      const files: Array<{ filename: string; subfolder: string; type: string; absPath: string; size: number }> = []
+      try {
+        mkdirSync(runDir, { recursive: true })
+        for (const source of sources) {
+          const buffer = await client.fetchView(source)
+          const relative = safeRelativePath(source.subfolder !== '' ? `${source.subfolder}/${source.filename}` : source.filename)
+          const absPath = uniqueOutputPath(runDir, relative)
+          writeFileSync(absPath, buffer.bytes)
+          files.push({ ...source, absPath, size: buffer.bytes.byteLength })
+        }
+      } catch (error) {
+        return fail('FETCH_FAILED', error instanceof Error ? error.message : String(error), promptId)
+      }
+
+      const ledger = upsertRun(runDir, {
+        promptId,
+        ts: new Date().toISOString(),
+        status: 'completed',
+        files,
+      })
+      return {
+        files,
+        targetDir: runDir,
+        promptId,
+        ledger: { file: join(runDir, 'runs.json'), records: ledger.records, note: ledger.note },
+        error: null,
+      }
+    },
+  }
+}
+
 /** Register the plugin tools; returns disposers. */
 export function registerComfyUITools(ctx: Context, runtime: ComfyUIRuntime): Array<() => void> {
   const tools = (ctx as unknown as { tools: { register(definition: ToolDefinition): () => void } }).tools
   const disposers: Array<() => void> = []
-  disposers.push(tools.register(runDefinition(runtime, ctx)))
-  disposers.push(tools.register(objectInfoDefinition(runtime)))
-  disposers.push(tools.register(workflowDefinition(runtime, ctx)))
-  disposers.push(tools.register(skillDefinition(runtime)))
+  // One bad definition must not take the whole loader chain down: the registry
+  // validates `output.schema` at register time and throws on an unsupported
+  // shape, which is exactly the failure this plugin used to escalate into a
+  // dead host. Each registration is isolated; a failure is reported and the
+  // remaining tools still go in.
+  const register = (definition: ToolDefinition): void => {
+    try {
+      disposers.push(tools.register(definition))
+    } catch (error) {
+      console.warn(`[dsh-comfyui] 工具 "${definition.name}" 注册失败，已跳过: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  register(runDefinition(runtime, ctx))
+  register(objectInfoDefinition(runtime))
+  register(workflowDefinition(runtime, ctx))
+  register(skillDefinition(runtime))
+  register(probeDefinition(runtime))
+  register(fetchOutputDefinition(runtime))
   return disposers
 }

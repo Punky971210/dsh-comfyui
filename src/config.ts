@@ -37,6 +37,10 @@ export const Config = z.object({
    * deletion falls back to removing the index record when neither works
    * (e.g. a ComfyUI running on another host). */
   outputDir: z.string().default(''),
+  /** Where this plugin writes downloaded media and the run ledger
+   * (`runs.json`). Empty means `<dataDir>/runs`. Distinct from `outputDir`,
+   * which locates *ComfyUI's* own output directory for asset deletion. */
+  downloadDir: z.string().default(''),
   /** ComfyUI install root(s) on this machine (absolute paths). Multiple
    * entries are allowed because ComfyUI folders can be mapped/mounted (extra
    * models dirs, several installs, portable copies). The agent reads them to
@@ -70,6 +74,8 @@ export type Config = {
   mediaHost: string
   /** ComfyUI's output directory on this machine; empty infers it from reported file paths. */
   outputDir: string
+  /** Where downloaded media and the run ledger go; empty means `<dataDir>/runs`. */
+  downloadDir: string
   /** ComfyUI install root(s) on this machine; the agent uses them to locate files directly. */
   comfyuiDirs: string[]
 }

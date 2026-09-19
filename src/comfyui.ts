@@ -142,7 +142,8 @@ export const CLIENT_ID = randomUUID()
 /** HTTP client over the ComfyUI REST API. */
 export class ComfyUIClient {
   constructor(
-    private readonly baseUrl: string,
+    /** Base URL of the server this client talks to (reported by the probe). */
+    readonly baseUrl: string,
     private readonly apiKey: string | undefined,
     private readonly connectTimeoutMs: number,
     private readonly maxMediaBytes: number,

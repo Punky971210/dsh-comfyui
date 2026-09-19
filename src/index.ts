@@ -115,6 +115,7 @@ export async function apply(ctx: Context, entryConfig: Partial<ConfigType>): Pro
     skillsDir: entryConfig.skillsDir ?? '',
     mediaHost: entryConfig.mediaHost ?? '',
     outputDir: entryConfig.outputDir ?? '',
+    downloadDir: entryConfig.downloadDir ?? '',
     comfyuiDirs: Array.isArray(entryConfig.comfyuiDirs)
       ? entryConfig.comfyuiDirs.filter((dir): dir is string => typeof dir === 'string' && dir.trim() !== '')
       : [],
@@ -164,6 +165,13 @@ export async function apply(ctx: Context, entryConfig: Partial<ConfigType>): Pro
     getApiKey: () => resolveApiKey(ctx, resolved.apiKeyEnv),
     createClient: (apiKey) => new ComfyUIClient(resolved.baseUrl, apiKey, resolved.connectTimeoutMs, resolved.maxMediaBytes),
     hostHint,
+    downloadDir: () => {
+      // Where the run ledger and fetched media live. Defaults to the plugin
+      // data directory rather than a repo-relative path so a packaged install
+      // writes somewhere it owns.
+      const configured = resolved.downloadDir.trim()
+      return configured !== '' ? configured : join(resolved.dataDir, 'runs')
+    },
     proxyBase: () => {
       // Explicit external media host wins (LAN/domain/reverse-proxy config);
       // otherwise use the origin browsers actually reached this server with;
