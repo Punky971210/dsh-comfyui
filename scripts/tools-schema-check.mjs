@@ -27,24 +27,21 @@ const { assertSupportedJsonSchema, validateJsonSchemaValue, JsonSchemaError } = 
 const { comfyUIToolDefinitions } = await import('../lib/tools.js')
 
 /**
- * Keywords the host's validator accepts. The STRICT set is what
- * `assertSupportedJsonSchema` enforces for `output.schema`; `parameters` rides
- * the more permissive projection path, which additionally honours the numeric
- * bounds the existing tools already use — recorded as an extension below so the
- * exception is visible rather than silent.
+ * Keywords the host's validator accepts. The set is applied to `parameters`
+ * and `output.schema` alike: the host's strict validator is the shape both
+ * sides must fit, and the PTC renderer that reads `parameters` accepts no more
+ * than it does. A keyword outside this set is a FAIL on either side.
  */
 const STRICT_KEYWORDS = new Set([
   'type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
   'description', 'title', 'default', 'examples',
 ])
-const PARAMETER_ONLY_KEYWORDS = new Set(['minimum', 'maximum'])
 const BANNED_KEYWORDS = ['$ref', 'allOf', 'anyOf', 'not', 'format', 'pattern', 'minLength', 'maxLength', 'uniqueItems']
 
 const scratch = mkdtempSync(join(tmpdir(), 'dsh-comfyui-schema-'))
 /** Values recorded for the report; keys are set by the walkers below. */
 const facts = []
 const failures = []
-const extensions = []
 
 function fail(tool, rule, detail) {
   failures.push({ tool, rule, detail })
@@ -90,16 +87,15 @@ function negativeFor(schema) {
  * Walk every node of a schema, collecting rule violations that a recursive
  * inspection can decide on its own.
  */
-function walk(node, path, tool, { isParameter, parent }) {
+function walk(node, path, tool, { parent }) {
   if (typeof node !== 'object' || node === null || Array.isArray(node)) return
   for (const key of BANNED_KEYWORDS) {
     if (key in node) fail(tool, 'R8-banned-keyword', `${path}.${key}`)
   }
   for (const key of Object.keys(node)) {
-    if (!STRICT_KEYWORDS.has(key) && !PARAMETER_ONLY_KEYWORDS.has(key)) {
+    if (!STRICT_KEYWORDS.has(key)) {
       fail(tool, 'R8-unknown-keyword', `${path}.${key}`)
     }
-    if (isParameter && PARAMETER_ONLY_KEYWORDS.has(key)) extensions.push({ tool, path: `${path}.${key}` })
   }
   if (Array.isArray(node.type)) fail(tool, 'R4-type-array', `${path}.type = ${JSON.stringify(node.type)}`)
   if (Array.isArray(node.oneOf)) {

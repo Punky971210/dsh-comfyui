@@ -555,16 +555,24 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
-      // Closed deliberately: the host does not validate `parameters` at
-      // register time, so a misspelled argument is only caught if the schema
-      // refuses it. Without this the call silently runs with the field ignored.
+      // Closed deliberately, for two reasons that are still true: it documents
+      // the exact argument surface, and it is what the PTC SDK rendering
+      // (`jsonSchemaToTs`) turns into the tool's input type. It does NOT make
+      // a misspelled argument fail: the host never validates a raw-channel
+      // `parameters` — not at register time (`dsh-tools` only runs
+      // `assertSupportedJsonSchema` on `output.schema`) and not at call time
+      // (only the returned value is validated). The real risk runs the other
+      // way: if a keyword here is outside the host's supported subset, that
+      // PTC rendering throws, the failure is swallowed, and this tool's input
+      // type silently degrades to `unknown`. Enforcement of the declared key
+      // set lives in `execute` (see `undeclaredArgumentFailure`).
       additionalProperties: false,
       properties: {
         workflow: { type: 'object', additionalProperties: true, description: 'ComfyUI API-format workflow: node id → { class_type, inputs }. Alternative to `template`.' },
         template: { type: 'string', enum: ['txt2img', 'img2img', 'video'], description: 'Built-in workflow template id. Alternative to `workflow`.' },
         inputs: { type: 'object', additionalProperties: true, description: 'Per-node input overrides keyed by node id, e.g. {"3": {"seed": 42, "steps": 30}, "6": {"text": "prompt"}}.' },
         mode: { type: 'string', enum: ['sync', 'async'], default: 'sync', description: 'sync waits and returns media; async returns a background job id.' },
-        timeout_ms: { type: 'number', minimum: 5_000, maximum: 3_600_000, description: 'Generation wait budget in ms (default 180000). Video needs minutes.' },
+        timeout_ms: { type: 'number', description: 'Generation wait budget in ms (default 180000). Video needs minutes.' },
         seed: { type: 'integer', description: 'One concrete sampling seed for this run, written into every seed input the graph carries and recorded in the ledger (reproducible replay). Explicit here it wins over the graph\'s authored value; omitted, the authored value is kept (the built-in templates default to 0, so pass a seed to vary the result).' },
         run_label: { type: 'string', description: 'Governance identity of this run (`<批次>-<lane>-<job>`), used as the ledger key; default `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>` with the sequence drawn from the ledger.' },
       },
@@ -851,15 +859,23 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
     ].join(' '),
     parameters: {
       type: 'object',
-      // Closed deliberately: the host does not validate `parameters` at
-      // register time, so a misspelled argument is only caught if the schema
-      // refuses it. Without this the call silently runs with the field ignored.
+      // Closed deliberately, for two reasons that are still true: it documents
+      // the exact argument surface, and it is what the PTC SDK rendering
+      // (`jsonSchemaToTs`) turns into the tool's input type. It does NOT make
+      // a misspelled argument fail: the host never validates a raw-channel
+      // `parameters` — not at register time (`dsh-tools` only runs
+      // `assertSupportedJsonSchema` on `output.schema`) and not at call time
+      // (only the returned value is validated). The real risk runs the other
+      // way: if a keyword here is outside the host's supported subset, that
+      // PTC rendering throws, the failure is swallowed, and this tool's input
+      // type silently degrades to `unknown`. Enforcement of the declared key
+      // set lives in `execute` (see `undeclaredArgumentFailure`).
       additionalProperties: false,
       properties: {
         action: { type: 'string', enum: ['list', 'run', 'get', 'refresh'], description: 'list returns the workflow library; run executes one workflow by id (direct call to the saved JSON); get returns one workflow\'s full JSON for inspection; refresh re-derives one workflow\'s parameter snapshot from the current node definitions and saves it back.' },
         id: { type: 'string', description: 'Workflow id (required for action: run and get).' },
         mode: { type: 'string', enum: ['sync', 'async'], description: 'run mode (default sync); async starts a background job and returns its id for job_output. Video/audio workflows should use async — generation takes minutes and sync may time out.' },
-        timeout_ms: { type: 'number', minimum: 5_000, maximum: 3_600_000, description: 'Generation wait budget in ms (default 900000 = 15 min). Video needs minutes; raise this for long videos.' },
+        timeout_ms: { type: 'number', description: 'Generation wait budget in ms (default 900000 = 15 min). Video needs minutes; raise this for long videos.' },
         run_label: { type: 'string', description: 'Governance identity for this run (`<批次>-<lane>-<job>`), used as the run-ledger key; default `<COMFYUI_RUN_PREFIX 或 comfyui>-<NNNN>`.' },
         parameters: {
           type: 'object',
