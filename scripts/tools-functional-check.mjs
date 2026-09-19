@@ -13,7 +13,7 @@
  * Exit 0 = every assertion held.
  */
 import { createServer } from 'node:http'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -52,6 +52,9 @@ for (const classType of ['EmptyLatentImage', 'CLIPTextEncode', 'VAEDecode', 'Loa
   OBJECT_INFO[classType] = {}
 }
 let queueSubmissions = 0
+// Counted so N-22 can state the `object_info` cost of each path as a measured
+// number instead of repeating a claim about it.
+let objectInfoCalls = 0
 
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', 'http://127.0.0.1')
@@ -62,7 +65,10 @@ const server = createServer((request, response) => {
   if (url.pathname === '/system_stats') {
     return json({ system: { comfyui_version: '0.3.99-smoke' }, devices: [{ name: 'cuda:0 NVIDIA Smoke', type: 'cuda', vram_free: 12_345 }] })
   }
-  if (url.pathname === '/object_info') return json(OBJECT_INFO)
+  if (url.pathname === '/object_info') {
+    objectInfoCalls += 1
+    return json(OBJECT_INFO)
+  }
   if (url.pathname === '/queue') return json({ queue_running: [], queue_pending: [[1, 'pending-prompt']] })
   if (url.pathname === '/prompt') {
     queueSubmissions += 1
@@ -111,13 +117,25 @@ function toolByName(name, runtime) {
  * exercised against this object, not against the mock runtime above (whose
  * `queue` is a stub). Returns the runtime plus the disposers that stop the
  * progress socket and the route mounts.
+ *
+ * `jobsPlan` decides what `ctx.get('jobs')` answers, which is the one seam the
+ * BI-1 takeover cases need:
+ *   undefined         -> no jobs service at all (the pre-submit refusal, N-9)
+ *   'start-throws'    -> the service is there but `start()` throws (N-16/N-17)
+ *   'vanish-on-read2' -> the service is there on the first read and gone on the
+ *                        second — i.e. it unloads between the pre-submit check
+ *                        and the takeover (N-18)
  */
-async function mountPlugin(baseUrl) {
+async function mountPlugin(baseUrl, jobsPlan) {
   const dataDir = mkdtempSync(join(tmpdir(), 'dsh-comfyui-mount-'))
   const disposers = []
   const capturedRuntime = { value: undefined }
   const tools = []
   const routes = []
+  const jobsReads = { count: 0 }
+  // `start` never gets far enough to register a job: BI-1 is about the failure
+  // of the takeover itself, not about what a started job would later do.
+  const jobsService = { start() { throw new Error('smoke: jobs service refused to start the task') } }
   // The fiber the plugin mounts its routes and media proxy on. In cordis the
   // sub-fiber reaches the isolated service through its own `get`, so the stub
   // has to serve it there too — that is the path `mountComfyUIRoutes` uses.
@@ -147,6 +165,12 @@ async function mountPlugin(baseUrl) {
     },
     get(name) {
       if (name === 'webServer') return webServerStub
+      if (name === 'jobs') {
+        jobsReads.count += 1
+        if (jobsPlan === 'start-throws') return jobsService
+        if (jobsPlan === 'vanish-on-read2') return jobsReads.count === 1 ? jobsService : undefined
+        return undefined
+      }
       return undefined
     },
     effect(callback) {
@@ -163,7 +187,7 @@ async function mountPlugin(baseUrl) {
   const runtime = introspectComfyUIRuntime(tools[0])
   const toolFor = (name) => tools.find((tool) => tool.name === name)
   const routeOf = (path) => routes.find((route) => route.path === path)?.handler
-  return { runtime, toolFor, dataDir, routeOf, routePaths: () => routes.map((route) => route.path), dispose: () => { for (const dispose of disposers) dispose() } }
+  return { runtime, toolFor, dataDir, runDir: join(dataDir, 'runs'), jobsReads, routeOf, routePaths: () => routes.map((route) => route.path), dispose: () => { for (const dispose of disposers) dispose() } }
 }
 
 /** A request/response pair for invoking a mounted route handler directly. */
@@ -710,8 +734,168 @@ assert('N-14 the second tool refuses its own misspelling too',
   workflowTypo.error?.code === 'UNKNOWN_ARGUMENT' || /UNKNOWN_ARGUMENT/.test(String(workflowTypo?.error?.message ?? '')),
   JSON.stringify(workflowTypo?.error ?? workflowTypo))
 
+// --- N-16/N-17/N-18/N-19/BI-1: a takeover that fails after the submit --------
+// The window: the prompt has already been POSTed to `/prompt`, and then the
+// background job cannot be started — either `start()` throws, or the jobs
+// service is gone by the second read (the pre-submit check read it once
+// already). The row the reservation opened must not stay `queued` with a null
+// promptId: that is the shape that made a submitted prompt unreachable from
+// `comfyui_fetch_output`, and it is exactly what this block pins down.
+//
+// Both mounts go through the plugin's own entry point and the real
+// `runtime.queue`, so `queueSubmissions` counts requests that really reached
+// the mock server — the invariant is not passed by "nothing was submitted".
+const takeoverMounts = []
+const takeoverCases = [
+  { caseId: 'N-16', label: 'comfyui_run / start() throws', plan: 'start-throws', tool: 'comfyui_run', infoCalls: 2 },
+  { caseId: 'N-17', label: 'comfyui_workflow run / start() throws', plan: 'start-throws', tool: 'comfyui_workflow', infoCalls: 1 },
+  { caseId: 'N-18', label: 'comfyui_run / jobs service vanishes on the second read', plan: 'vanish-on-read2', tool: 'comfyui_run', infoCalls: 2 },
+  { caseId: 'N-18', label: 'comfyui_workflow run / jobs service vanishes on the second read', plan: 'vanish-on-read2', tool: 'comfyui_workflow', infoCalls: 1 },
+]
+const objectInfoCounts = []
+for (const entry of takeoverCases) {
+  const takeoverMount = await mountPlugin(`http://127.0.0.1:${port}`, entry.plan)
+  takeoverMounts.push(takeoverMount)
+  const savedTakeover = await takeoverMount.runtime.saveWorkflow({
+    name: 'smoke-takeover',
+    description: 'BI-1 夹具：接管失败时台账必须落终态',
+    workflow: {
+      '3': { class_type: 'KSampler', inputs: { seed: 0, steps: 20, cfg: 6.5 } },
+      '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: 'sd_xl_base_1.0.safetensors' } },
+      '9': { class_type: 'SaveImage', inputs: { filename_prefix: 'dsh-comfyui' } },
+    },
+  })
+  const takeoverWorkflowId = savedTakeover.workflow?.id ?? savedTakeover.id
+  const label = `${entry.caseId} (${entry.label})`
+  const args = entry.tool === 'comfyui_run'
+    ? { template: 'txt2img', mode: 'async', run_label: `${entry.caseId.toLowerCase()}-0001` }
+    : { action: 'run', id: takeoverWorkflowId, mode: 'async', run_label: `${entry.caseId.toLowerCase()}w-0001` }
+  const submissionsBeforeTakeover = queueSubmissions
+  const objectInfoBeforeTakeover = objectInfoCalls
+  const rowsBeforeTakeover = readLedger(takeoverMount.runDir).records.length
+  let takeoverThrew
+  let takeoverReturned
+  try {
+    takeoverReturned = await takeoverMount.toolFor(entry.tool).execute(args, exec)
+    takeoverThrew = null
+  } catch (error) {
+    takeoverThrew = error
+  }
+  objectInfoCounts.push({
+    path: entry.tool,
+    caseId: entry.caseId,
+    objectInfoCalls: objectInfoCalls - objectInfoBeforeTakeover,
+    expected: entry.infoCalls,
+  })
+  const rows = readLedger(takeoverMount.runDir).records
+  const row = rows[0]
+  const expectedPromptId = `mock-prompt-${queueSubmissions}`
+  assert(`${label}: the caller learns the takeover failed instead of being handed a background job`,
+    takeoverThrew instanceof Error && /background jobs unavailable/.test(takeoverThrew.message)
+    && takeoverReturned === undefined,
+    JSON.stringify({ threw: takeoverThrew === null ? null : takeoverThrew.message, returned: takeoverReturned ?? null }))
+  assert(`${label}: the prompt really had been submitted before the takeover failed`,
+    queueSubmissions - submissionsBeforeTakeover === 1,
+    `submissions ${submissionsBeforeTakeover} -> ${queueSubmissions}`)
+  assert(`${label}: the failure names the submitted promptId so it is not read as "nothing was sent"`,
+    takeoverThrew instanceof Error && takeoverThrew.message.includes(expectedPromptId),
+    String(takeoverThrew instanceof Error ? takeoverThrew.message : takeoverThrew))
+  assert(`${label}: no queued row is left behind`,
+    rows.filter((item) => item.status === 'queued').length === 0, JSON.stringify(rows))
+  assert(`${label}: the reservation row is terminal and carries the real promptId`,
+    rows.length === rowsBeforeTakeover + 1
+    && (row?.status === 'failed' || row?.status === 'interrupted')
+    && row.promptId === expectedPromptId,
+    JSON.stringify({ rows, expectedPromptId }))
+  assert(`${label}: the failure is coded JOBS_UNAVAILABLE with no node errors`,
+    row?.error?.code === 'JOBS_UNAVAILABLE' && row.error.nodeErrors === null, JSON.stringify(row?.error))
+  assert(`${label}: the run took exactly two jobs-service reads (pre-submit check + takeover)`,
+    takeoverMount.jobsReads.count === 2, String(takeoverMount.jobsReads.count))
+  // N-19: that promptId is the handle out. Fetching by it must fill the SAME
+  // row in — a second row would mean the run and its output had drifted apart.
+  const fetchRowsBefore = rows.length
+  const takeoverFetch = await takeoverMount.toolFor('comfyui_fetch_output').execute({ promptId: expectedPromptId }, exec)
+  const rowsAfterFetch = readLedger(takeoverMount.runDir).records
+  assert(`${label}/N-19: fetching by that promptId fills the same row instead of opening another`,
+    rowsAfterFetch.length === fetchRowsBefore
+    && rowsAfterFetch.find((item) => item.runLabel === row?.runLabel)?.files?.[0]?.absPath === takeoverFetch?.files?.[0]?.absPath
+    && typeof takeoverFetch?.files?.[0]?.absPath === 'string',
+    JSON.stringify({ rowsBefore: fetchRowsBefore, rowsAfter: rowsAfterFetch.length, rowFiles: rowsAfterFetch.find((item) => item.runLabel === row?.runLabel)?.files ?? null, fetched: takeoverFetch?.files?.[0]?.absPath ?? null }))
+}
+
+// --- N-22/BI-2: the object_info cost of each path, measured ------------------
+// `comfyui_run` reads the snapshot twice per successful submit (its own early
+// check, then the submit throat); every other path goes through the throat
+// alone. Both numbers are recorded rather than described.
+const runInfoCounts = objectInfoCounts.filter((entry) => entry.path === 'comfyui_run')
+const workflowInfoCounts = objectInfoCounts.filter((entry) => entry.path === 'comfyui_workflow')
+assert('N-22 comfyui_run reads object_info twice per successful submit',
+  runInfoCounts.length === 2 && runInfoCounts.every((entry) => entry.objectInfoCalls === 2),
+  JSON.stringify(runInfoCounts))
+assert('N-22 comfyui_workflow reaches object_info once per successful submit',
+  workflowInfoCounts.length === 2 && workflowInfoCounts.every((entry) => entry.objectInfoCalls === 1),
+  JSON.stringify(workflowInfoCounts))
+
+// --- N-20/N-21/BI-1+BI-2 static: the shape the runtime cases rest on ---------
+// N-20: both takeover segments must actually be wrapped — a passing runtime case
+// on one path would otherwise hide the other path still throwing raw.
+const takeoverWindows = [...toolsSource.matchAll(/if \(mode === 'async'\) \{\s*\n\s*let jobId: string\s*\n\s*try \{/g)]
+  .map((match) => {
+    const tail = toolsSource.slice(match.index, match.index + 4000)
+    const end = tail.indexOf("Result = { kind: 'background'")
+    return end < 0 ? tail : tail.slice(0, end)
+  })
+assert('N-20 both async takeover segments wrap start() in try/catch and close the row out',
+  takeoverWindows.length === 2 && takeoverWindows.every((window) => window.includes('catch (error) {')
+    && window.includes('upsertRun(runDir, { ...')
+    && window.includes('jobsTakeoverFailure(')
+    && window.includes("status: 'failed'")
+    && window.includes('throw new Error(failure.message)')
+    && !window.includes("status: 'queued'")),
+  JSON.stringify({ windows: takeoverWindows.length, lengths: takeoverWindows.map((window) => window.length) }))
+
+// N-21: the callsite count that BI-2 is judged on, counted the way the
+// criterion words it (definition excluded), plus a zero-hit sweep for the dead
+// export on both sides of the build.
+function sourceFiles(root) {
+  const out = []
+  for (const name of readdirSync(new URL(root, import.meta.url), { withFileTypes: true })) {
+    if (name.isDirectory()) out.push(...sourceFiles(`${root}/${name.name}`))
+    else if (/\.(ts|js)$/.test(name.name)) out.push(new URL(`${root}/${name.name}`, import.meta.url))
+  }
+  return out
+}
+const preflightCallsites = []
+for (const file of sourceFiles('../src')) {
+  const lines = readFileSync(file, 'utf8').split('\n')
+  lines.forEach((line, index) => {
+    if (/preflightWorkflow\(/.test(line) && !/export function preflightWorkflow\(/.test(line)) {
+      preflightCallsites.push(`${file.pathname.split('/src/')[1]}:${index + 1}`)
+    }
+  })
+}
+assert('N-21 preflightWorkflow( has exactly 2 callsites once the definition is excluded',
+  preflightCallsites.length === 2
+  && preflightCallsites.some((site) => site.startsWith('index.ts:'))
+  && preflightCallsites.some((site) => site.startsWith('tools.ts:')),
+  JSON.stringify(preflightCallsites))
+const deadExportHits = []
+for (const root of ['../src', '../lib']) {
+  for (const file of sourceFiles(root)) {
+    const text = readFileSync(file, 'utf8')
+    const count = (text.match(/preflightApproved/g) ?? []).length
+    if (count > 0) deadExportHits.push(`${root}/${file.pathname.split('/').pop()}:${count}`)
+  }
+}
+assert('N-21 preflightApproved is gone from both src/ and lib/',
+  deadExportHits.length === 0, JSON.stringify(deadExportHits))
+
 slowServer.close()
 for (const dir of [concurrentDir, asyncDir, mounted.dataDir]) rmSync(dir, { recursive: true, force: true })
+for (const takeMount of takeoverMounts) {
+  takeMount.dispose()
+  rmSync(takeMount.dataDir, { recursive: true, force: true })
+}
 server.close()
 for (const dir of [downloads, corruptDir, fetchDir]) rmSync(dir, { recursive: true, force: true })
 
