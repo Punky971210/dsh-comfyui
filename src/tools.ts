@@ -1756,6 +1756,24 @@ function fetchOutputDefinition(runtime: ComfyUIRuntime): ToolDefinition {
   }
 }
 
+/**
+ * Every tool this plugin registers, in registration order.
+ *
+ * The list is exported so the schema self-check can enumerate the tools from
+ * the same source that registers them: a hand-written list in the check would
+ * quietly stop covering a tool the moment one was added.
+ */
+export function comfyUIToolDefinitions(ctx: Context, runtime: ComfyUIRuntime): ToolDefinition[] {
+  return [
+    runDefinition(runtime, ctx),
+    objectInfoDefinition(runtime),
+    workflowDefinition(runtime, ctx),
+    skillDefinition(runtime),
+    probeDefinition(runtime),
+    fetchOutputDefinition(runtime),
+  ]
+}
+
 /** Register the plugin tools; returns disposers. */
 export function registerComfyUITools(ctx: Context, runtime: ComfyUIRuntime): Array<() => void> {
   const tools = (ctx as unknown as { tools: { register(definition: ToolDefinition): () => void } }).tools
@@ -1772,11 +1790,6 @@ export function registerComfyUITools(ctx: Context, runtime: ComfyUIRuntime): Arr
       console.warn(`[dsh-comfyui] 工具 "${definition.name}" 注册失败，已跳过: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  register(runDefinition(runtime, ctx))
-  register(objectInfoDefinition(runtime))
-  register(workflowDefinition(runtime, ctx))
-  register(skillDefinition(runtime))
-  register(probeDefinition(runtime))
-  register(fetchOutputDefinition(runtime))
+  for (const definition of comfyUIToolDefinitions(ctx, runtime)) register(definition)
   return disposers
 }
