@@ -5,10 +5,13 @@
  * Why this exists: this machine's `@deepseek-ai/dsh-tools` validates a tool's
  * `output.schema` at REGISTER time (throwing a `JsonSchemaError` that takes the
  * whole loader chain down, since registration is not wrapped by every caller),
- * but never validates `parameters` until a call is made. A wrong `parameters`
- * shape therefore ships silently and blows up on the first tool call. This
- * script runs the very same validators the host runs, offline, against EVERY
- * registered tool — not a sample.
+ * but NEVER validates `parameters` — not at registration, and not when a call
+ * is made (only the returned value is validated afterwards). A wrong
+ * `parameters` shape therefore ships silently: the field is ignored at call
+ * time, and under PTC the SDK rendering of it fails and degrades the tool's
+ * input type to `unknown`. This script runs the host's own validators offline
+ * against EVERY registered tool — not a sample — so that silence is not the
+ * only feedback.
  *
  * It imports the built plugin (`lib/`) so it checks what actually loads, and it
  * enumerates the tools from `comfyUIToolDefinitions`, the same list
@@ -117,11 +120,11 @@ function walk(node, path, tool, { parent }) {
     }
   }
   for (const [key, child] of Object.entries(node.properties ?? {})) {
-    walk(child, `${path}.properties.${key}`, tool, { isParameter, parent: node })
+    walk(child, `${path}.properties.${key}`, tool, { parent: node })
   }
-  if (node.items !== undefined) walk(node.items, `${path}.items`, tool, { isParameter, parent: node })
+  if (node.items !== undefined) walk(node.items, `${path}.items`, tool, { parent: node })
   if (Array.isArray(node.oneOf)) {
-    node.oneOf.forEach((branch, index) => walk(branch, `${path}.oneOf[${index}]`, tool, { isParameter, parent: node }))
+    node.oneOf.forEach((branch, index) => walk(branch, `${path}.oneOf[${index}]`, tool, { parent: node }))
   }
   // A required NAME inside a property node is the DSL spelling and means
   // nothing on the raw channel — flag it so the two channels never mix.
@@ -215,9 +218,10 @@ for (const tool of tools) {
     fail(name, 'A3-assertSupportedJsonSchema', error instanceof JsonSchemaError ? error.message : String(error))
   }
 
-  // A5/A6/A7/A8 + R4/R5/R9: recursive inspection.
-  walk(parameters, 'parameters', name, { isParameter: true, parent: undefined })
-  walk(outputSchema, 'output.schema', name, { isParameter: false, parent: undefined })
+  // A5/A6/A7/A8 + R4/R5/R9: recursive inspection. The same rule set is applied
+  // to both sides — there is no permissive projection path to exempt.
+  walk(parameters, 'parameters', name, { parent: undefined })
+  walk(outputSchema, 'output.schema', name, { parent: undefined })
 
   // A2: no `type` arrays anywhere (walk() covers it; this is the counter).
   const typeArrays = []
@@ -291,7 +295,6 @@ const summary = {
   tools: tools.length,
   names: tools.map((tool) => tool.name),
   failures,
-  parameterOnlyKeywords: [...new Set(extensions.map((entry) => `${entry.tool}: ${entry.path}`))],
   report,
 }
 
@@ -302,11 +305,8 @@ if (process.argv.includes('--json')) {
   for (const entry of report) {
     console.log(`  OK   ${entry.tool.padEnd(24)} output.schema=通过  required=${JSON.stringify(entry.required)} 闭合 object=${entry.closedObjects} 正样本 violation=${entry.positiveViolations.length} 负样本 violation=${entry.negativeViolations.length}`)
   }
-  if (summary.parameterOnlyKeywords.length > 0) {
-    console.log(`  注   parameters 侧使用的宽松关键字（非 output.schema 白名单，宿主注册期不校验 parameters，调用期接受）：${summary.parameterOnlyKeywords.join(', ')}`)
-  }
   if (failures.length === 0) {
-    console.log(`\n结论：全部 ${summary.tools} 个工具合规（FAIL 0）。`)
+    console.log(`\n结论：全部 ${summary.tools} 个工具合规（FAIL 0，无例外）。`)
   } else {
     console.log(`\n结论：FAIL ${failures.length} 项`)
     for (const entry of failures) console.log(`  FAIL ${entry.tool} [${entry.rule}] ${entry.detail}`)

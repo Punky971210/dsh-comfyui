@@ -19,6 +19,7 @@ import { ProgressTracker } from './progress.js'
 import { COMFYUI_SKILL } from './skill.js'
 import type { StoredWorkflow } from './store.js'
 import { analyzeWorkflowParameters, applyWorkflowParameters, type Workflow } from './params.js'
+import { PreflightRefusal, preflightFailure, preflightWorkflow, requireObjectInfo } from './preflight.js'
 import { createWorkflowSkillPacks } from './skillpack.js'
 import { registerComfyUITools, type ComfyUIRuntime } from './tools.js'
 import { mountComfyUIRoutes } from './routes.js'
@@ -39,22 +40,6 @@ export { Config }
 export const inject = ['tools']
 
 const COMFYUI_NS = 'comfyui'
-
-/** object_info is large and changes only when nodes are (re)installed. */
-const OBJECT_INFO_TTL_MS = 60_000
-let objectInfoCache: { ts: number; value: Record<string, unknown> } | undefined
-
-async function objectInfoCached(client: ComfyUIClient): Promise<Record<string, unknown> | undefined> {
-  const now = Date.now()
-  if (objectInfoCache !== undefined && now - objectInfoCache.ts < OBJECT_INFO_TTL_MS) return objectInfoCache.value
-  try {
-    const value = await client.objectInfo()
-    objectInfoCache = { ts: now, value }
-    return value
-  } catch {
-    return undefined
-  }
-}
 
 /** Structural slice of the credentials service (avoid a hard package dep). */
 interface CredentialsService {
@@ -208,12 +193,28 @@ export async function apply(ctx: Context, entryConfig: Partial<ConfigType>): Pro
     queue: async (workflow, meta) => {
       const client = runtime.createClient(await resolveApiKey(ctx, resolved.apiKeyEnv))
       let prompt = workflow as unknown as Workflow
+      // One `object_info` read serves both the parameter rewrite (option lists
+      // and combo children) and the submit-time preflight below. It is fetched
+      // through `requireObjectInfo`, so an unreadable snapshot refuses the run
+      // instead of letting the parameters silently drop or the preflight skip.
+      const required = await requireObjectInfo(() => client.objectInfo())
+      if (!required.ok) throw new PreflightRefusal(required.failure)
       if (meta.parameters !== undefined && meta.parameters.length > 0) {
-        const objectInfo = await objectInfoCached(client)
         const slots = await store.loadSlots()
         const loaded = slots.filter((slot): slot is NonNullable<typeof slot> => slot !== null)
-        prompt = applyWorkflowParameters(prompt, meta.parameters, meta.values ?? {}, objectInfo, await store.loadMediaSizes(), loaded)
+        prompt = applyWorkflowParameters(prompt, meta.parameters, meta.values ?? {}, required.objectInfo, await store.loadMediaSizes(), loaded)
       }
+      // The submit-time preflight lives HERE, on the only path that reaches
+      // `/prompt`: every caller (`comfyui_run`, `comfyui_workflow action: run`,
+      // the panel's run and rerun routes) is covered by one check, and it
+      // evaluates the FINAL graph — the one the parameters produced — rather
+      // than the caller's input. A refusal throws before anything is submitted,
+      // so no model can be fetched to satisfy a gap.
+      const verdict = preflightWorkflow(
+        prompt as unknown as Record<string, { class_type: string; inputs: Record<string, unknown> }>,
+        required.objectInfo,
+      )
+      if (!verdict.ok) throw new PreflightRefusal(preflightFailure(verdict, runtime.downloadDir()))
       const extraData: Record<string, unknown> = {}
       if (meta.workflowId !== undefined && meta.workflowId !== null && meta.workflowName !== null) {
         // ComfyUI's job metadata derives workflow_id from extra_pnginfo.workflow.id.

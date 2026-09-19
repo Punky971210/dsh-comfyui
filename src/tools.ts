@@ -30,8 +30,10 @@ import {
 import {
   extractNodeErrors,
   preflightFailure,
+  preflightRefusalFailure,
   preflightUnavailable,
   preflightWorkflow,
+  undeclaredArgumentKeys,
   type RunFailure,
 } from './preflight.js'
 
@@ -221,6 +223,10 @@ interface ToolDefinition {
   }
   timeoutMs?: number
   execute(args: Record<string, unknown>, exec: ToolRunContext): Promise<unknown>
+  /** The runtime this definition is wired to. Not read by the host; it exists
+   * so the checks can reach the runtime (`ComfyUIRuntime.queue`, where the
+   * submit-time preflight lives) instead of rebuilding it. */
+  runtime?: ComfyUIRuntime
 }
 
 interface JobsService {
@@ -238,6 +244,52 @@ interface JobsService {
 
 const TOOL_TIMEOUT_MS = 3_600_000
 
+/**
+ * Everything one `comfyui_run` does before it may touch the server: draw the
+ * governance identity, open the queued ledger row, run the early preflight and
+ * resolve the seeds.
+ *
+ * The order matters and is the fix for the sequence race (B-2):
+ *
+ * 1. `resolveSeeds` is synchronous and must run first, because the row has to
+ *    record the values that were submitted.
+ * 2. The early preflight is the last thing allowed to await, so a refused
+ *    graph is refused before any sequence number is consumed.
+ * 3. `openRun` then draws the number and writes the queued row in ONE
+ *    synchronous stretch — nothing awaitable may be introduced between them,
+ *    or two concurrent runs read the same number and collapse into one row.
+ * 4. The caller must submit immediately after this returns: any new `await`
+ *    between here and the submit widens that window again.
+ *
+ * It returns either the identity to continue with, or a finished refusal
+ * result — the only two outcomes a caller has to handle.
+ */
+async function preflightRun(
+  runtime: ComfyUIRuntime,
+  client: ComfyUIClient,
+  requestedLabel: unknown,
+  workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>,
+  requestedSeed: number | undefined,
+  params: Record<string, unknown>,
+  label: string,
+): Promise<{ ok: false; result: RunResult } | { ok: true; runDir: string; runLabel: string; seed: number | null; seeds: Record<string, number> }> {
+  const { seed, seeds } = resolveSeeds(workflow, requestedSeed)
+  let objectInfo: Record<string, unknown>
+  try {
+    objectInfo = await client.objectInfo()
+  } catch (error) {
+    const failure = preflightUnavailable(error instanceof Error ? error.message : String(error))
+    const { runDir, runLabel } = openRun(runtime, requestedLabel, { params, workflowName: label, seed: seed ?? undefined, seeds })
+    return { ok: false, result: refusedRun(runLabel, runDir, params, failure, seed, seeds) }
+  }
+  const preflight = preflightWorkflow(workflow, objectInfo)
+  const { runDir, runLabel } = openRun(runtime, requestedLabel, { params, workflowName: label, seed: seed ?? undefined, seeds })
+  if (!preflight.ok) {
+    return { ok: false, result: refusedRun(runLabel, runDir, params, preflightFailure(preflight, runDir), seed, seeds) }
+  }
+  return { ok: true, runDir, runLabel, seed, seeds }
+}
+
 function missing(args: Record<string, unknown>, name: string): boolean {
   return args[name] === undefined || args[name] === null
 }
@@ -247,6 +299,23 @@ function requireOneOf(args: Record<string, unknown>, names: readonly string[]): 
   if (present.length === 0) return `exactly one of ${names.join(', ')} is required`
   if (present.length > 1) return `only one of ${names.join(', ')} may be given`
   return undefined
+}
+
+/**
+ * The refusal for an argument this tool never declares, or `undefined` when
+ * every key is known. The message lists what IS accepted: the host does not
+ * validate `parameters` on the raw channel, so without this the model gets no
+ * feedback at all and the typo is silently dropped.
+ */
+function undeclaredArgumentFailure(tool: ToolDefinition, args: Record<string, unknown>): RunFailure | undefined {
+  const undeclared = undeclaredArgumentKeys(tool.parameters, args)
+  if (undeclared.length === 0) return undefined
+  const declared = Object.keys((tool.parameters['properties'] ?? {}) as Record<string, unknown>)
+  return {
+    code: 'UNKNOWN_ARGUMENT',
+    message: `${tool.name}: 未声明的参数 ${undeclared.join(', ')} — 本工具接受的参数：${declared.join(', ')}。宿主不校验 raw 通道的 parameters，拼错的键只会被静默忽略，故在此显式拒绝。`,
+    nodeErrors: null,
+  }
 }
 
 function buildWorkflow(args: Record<string, unknown>): { workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>; label: string } {
@@ -473,13 +542,22 @@ async function waitAndRecord(
 }
 
 /**
- * The run identity both `comfyui_run` and `comfyui_workflow action: run` open
- * their ledger row with: the governance key, the directory the ledger lives in,
- * and the sequence number when one had to be drawn.
+ * Open one run's ledger row: `runLabel` and the sequence number are drawn from
+ * the ledger and the `queued` row is written, all in ONE synchronous stretch.
+ *
+ * This function is deliberately synchronous and must stay that way. Reading the
+ * next sequence number and writing the row that reserves it are two ledger
+ * accesses; any `await` between them lets a second run (another agent, another
+ * lane, sharing this plugin instance and download directory) read the same
+ * number and open the same key, so the two runs' records collapse into one row
+ * and the cursor is consumed twice. Everything that needs awaiting — resolving
+ * the API key, building the workflow, resolving seeds — happens before this
+ * call, never inside it.
  */
-function beginRun(
+function openRun(
   runtime: ComfyUIRuntime,
   requestedLabel: unknown,
+  entry: { params: Record<string, unknown>; workflowName?: string | null; seed?: number; seeds?: Record<string, number> },
 ): { runDir: string; runLabel: string; requested: string; job: number } {
   const runDir = runtime.downloadDir()
   const requested = typeof requestedLabel === 'string' && requestedLabel.trim() !== ''
@@ -487,13 +565,26 @@ function beginRun(
     : resolveRunPrefix()
   // An explicit label ending in digits is already a sequence; anything else is
   // a prefix and gets the next number this ledger has not used.
-  if (/-\d+$/.test(requested)) return { runDir, runLabel: requested, requested, job: 0 }
-  const job = nextJobNumber(runDir, requested)
-  return { runDir, runLabel: formatRunLabel(requested, job), requested, job }
+  const explicit = /-\d+$/.test(requested)
+  const job = explicit ? 0 : nextJobNumber(runDir, requested)
+  const runLabel = explicit ? requested : formatRunLabel(requested, job)
+  const base: LedgerRecord = {
+    runLabel,
+    seed: entry.seed ?? undefined,
+    seeds: entry.seeds ?? {},
+    params: entry.params,
+    workflowName: entry.workflowName ?? null,
+    ts: new Date().toISOString(),
+    status: 'queued',
+  }
+  // The queued row is written before the submit, so an interrupt or a crash
+  // between here and the terminal state still leaves the attempt on record.
+  upsertRun(runDir, base)
+  return { runDir, runLabel, requested, job }
 }
 
 /** A run result with no terminal state yet (used for the refused paths). */
-function emptyResult(runLabel: string, runDir: string, failure: RunFailure): RunResult {
+function emptyResult(runLabel: string, runDir: string | null, failure: RunFailure): RunResult {
   return {
     kind: 'sync',
     promptId: runLabel,
@@ -600,17 +691,23 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
     async execute(args, exec) {
       const problem = requireOneOf(args, ['workflow', 'template'])
       if (problem !== undefined) throw new Error(`comfyui_run: ${problem}`)
+      const undeclaredArgs = undeclaredArgumentFailure(this, args)
+      if (undeclaredArgs !== undefined) return emptyResult('', null, undeclaredArgs)
       const mode = args.mode === undefined ? 'sync' : args.mode
       if (mode !== 'sync' && mode !== 'async') throw new Error(`comfyui_run: mode must be sync or async, got ${String(mode)}`)
+      // Background mode is decided before anything is committed: without a jobs
+      // service the run is refused here, so no ledger row is opened and no
+      // sequence number is consumed for a run that could never be collected.
+      // Wording kept verbatim for callers that match on it.
+      if (mode === 'async' && ctx.get('jobs') === undefined) {
+        throw new Error('comfyui_run: background jobs unavailable — load @deepseek-ai/dsh-jobs-local and @deepseek-ai/dsh-tool-jobs')
+      }
       const config = runtime.getConfig()
       const apiKey = await runtime.getApiKey()
       const client = runtime.createClient(apiKey)
       const { workflow, label } = buildWorkflow(args)
       const waitMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : config.timeoutMs
 
-      // Governance identity first: the ledger row, the refusal record and the
-      // replay all address this run by the same key.
-      const { runDir, runLabel } = beginRun(runtime, args.run_label)
       const requestedSeed = typeof args.seed === 'number' && Number.isFinite(args.seed) && args.seed !== -1
         ? Math.floor(args.seed)
         : undefined
@@ -623,22 +720,11 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
         ...(typeof args.timeout_ms === 'number' ? { timeout_ms: args.timeout_ms } : {}),
         node_overrides: args.inputs === undefined ? 0 : Object.keys(args.inputs as Record<string, unknown>).length,
       }
-
-      // D4 preflight: read object_info, check class types and loader values,
-      // refuse on any gap. Read-only — a missing model is reported, never
-      // downloaded, and nothing is queued.
-      let objectInfo: Record<string, unknown>
-      try {
-        objectInfo = await client.objectInfo()
-      } catch (error) {
-        return refusedRun(runLabel, runDir, params, preflightUnavailable(error instanceof Error ? error.message : String(error)), null, {})
-      }
-      const preflight = preflightWorkflow(workflow, objectInfo)
-      if (!preflight.ok) {
-        return refusedRun(runLabel, runDir, params, preflightFailure(preflight, runDir), null, {})
-      }
-
-      const { seed, seeds } = resolveSeeds(workflow, requestedSeed)
+      // Identity, queued row, early preflight, seeds — in that order, with the
+      // reserve-then-write pair kept inside one synchronous function (B-2).
+      const prepared = await preflightRun(runtime, client, args.run_label, workflow, requestedSeed, params, label)
+      if (!prepared.ok) return prepared.result
+      const { runDir, runLabel, seed, seeds } = prepared
       const base: LedgerRecord = {
         runLabel,
         seed: seed ?? undefined,
@@ -648,15 +734,20 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
         ts: new Date().toISOString(),
         status: 'queued',
       }
-      // The queued row is opened before the submit, so an interrupt or a crash
-      // between here and the terminal state still leaves the attempt on record.
-      upsertRun(runDir, base)
-
       const startedAt = Date.now()
       let promptId: string
       try {
         promptId = await runtime.queue(workflow, { workflowName: label, source: 'tool' })
       } catch (error) {
+        // The submit throat refuses a graph it cannot preflight (`PREFLIGHT*`):
+        // that is a refusal, not a submit failure, and it carries its own code
+        // and detail. Anything else really was a failed submit.
+        const refusal = preflightRefusalFailure(error)
+        if (refusal !== undefined) {
+          // The row the reservation opened is closed out as a refusal: it must
+          // carry the refusal's own code, not a generic submit failure.
+          return refusedRun(runLabel, runDir, params, refusal, seed, seeds)
+        }
         const failure: RunFailure = {
           code: 'SUBMIT_FAILED',
           message: error instanceof Error ? error.message : String(error),
@@ -682,10 +773,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
       base.promptId = promptId
 
       if (mode === 'async') {
-        const jobs = ctx.get('jobs') as JobsService | undefined
-        if (jobs === undefined) {
-          throw new Error('comfyui_run: background jobs unavailable — load @deepseek-ai/dsh-jobs-local and @deepseek-ai/dsh-tool-jobs')
-        }
+        const jobs = ctx.get('jobs') as JobsService
         const jobId = jobs.start({
           kind: 'comfyui',
           label,
@@ -793,9 +881,17 @@ function objectInfoDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     description: 'List the node definitions the configured ComfyUI server supports (class types, required and optional inputs). Use it to build valid API-format workflows for comfyui_run. Optional `filter` narrows by class-name substring, e.g. "KSampler", "VAE", "LoadImage".',
     parameters: {
       type: 'object',
-      // Closed deliberately: the host does not validate `parameters` at
-      // register time, so a misspelled argument is only caught if the schema
-      // refuses it. Without this the call silently runs with the field ignored.
+      // Closed deliberately, for two reasons that are still true: it documents
+      // the exact argument surface, and it is what the PTC SDK rendering
+      // (`jsonSchemaToTs`) turns into the tool's input type. It does NOT make
+      // a misspelled argument fail: the host never validates a raw-channel
+      // `parameters` — not at register time (`dsh-tools` only runs
+      // `assertSupportedJsonSchema` on `output.schema`) and not at call time
+      // (only the returned value is validated). The real risk runs the other
+      // way: if a keyword here is outside the host's supported subset, that
+      // PTC rendering throws, the failure is swallowed, and this tool's input
+      // type silently degrades to `unknown`. Enforcement of the declared key
+      // set lives in `execute` (see `undeclaredArgumentFailure`).
       additionalProperties: false,
       properties: {
         filter: { type: 'string', description: 'Optional substring filter on node class names.' },
@@ -816,6 +912,12 @@ function objectInfoDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     },
     timeoutMs: 60_000,
     async execute(args) {
+      // `output.schema` here is closed and has no refusable shape, so the
+      // refusal is thrown with the same code in it rather than faked as an
+      // empty listing — an empty answer would read as "the server has no
+      // nodes", which is the opposite of what happened.
+      const undeclaredArgs = undeclaredArgumentFailure(this, args)
+      if (undeclaredArgs !== undefined) throw new Error(undeclaredArgs.message)
       const client = runtime.createClient(await runtime.getApiKey())
       const raw = await client.objectInfo()
       const entries = Object.entries(raw as Record<string, {
@@ -904,6 +1006,9 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
           parameterCount?: number
           error?: RunFailure | null
           skill?: { workflowName: string; summary: string; body: string; resourceBase: string; files: string[] }
+        }
+        if (data.action === 'error') {
+          return [{ type: 'text', text: data.error?.message ?? 'comfyui_workflow: 调用被拒绝' }]
         }
         if (data.action === 'skill') {
           const pack = data.skill
@@ -1012,6 +1117,10 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
       const action = args.action
       if (action !== 'list' && action !== 'run' && action !== 'get' && action !== 'refresh' && action !== 'skill') {
         throw new Error(`comfyui_workflow: action must be list, run, skill, get, or refresh, got ${String(action)}`)
+      }
+      const undeclaredArgs = undeclaredArgumentFailure(this, args)
+      if (undeclaredArgs !== undefined) {
+        return { action: 'error', error: undeclaredArgs }
       }
       if (action === 'list') {
         const [workflows, comfyui, slots] = await Promise.all([
@@ -1159,14 +1268,25 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
       const values = typeof args.parameters === 'object' && args.parameters !== null
         ? (args.parameters as Record<string, unknown>)
         : {}
-      // The run identity is the same governance key comfyui_run uses, and it is
-      // what makes this path land on the ledger instead of only in history.
-      const { runDir, runLabel } = beginRun(runtime, args.run_label)
       const mode = args.mode === undefined ? 'sync' : args.mode
       if (mode !== 'sync' && mode !== 'async') {
         throw new Error(`comfyui_workflow: mode must be sync or async, got ${String(mode)}`)
       }
+      // Background mode is decided before anything is committed: without a jobs
+      // service the run is refused here, so no ledger row is opened and no
+      // sequence number is consumed for a run that could never be collected.
+      if (mode === 'async' && ctx.get('jobs') === undefined) {
+        throw new Error('comfyui_workflow: background jobs unavailable — load @deepseek-ai/dsh-jobs-local and @deepseek-ai/dsh-tool-jobs')
+      }
       const waitMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : config.timeoutMs
+      // The run identity is the same governance key comfyui_run uses, and it is
+      // what makes this path land on the ledger instead of only in history.
+      // Row plus sequence number in one synchronous stretch (B-2): nothing is
+      // awaited between drawing the number and reserving it.
+      const { runDir, runLabel } = openRun(runtime, args.run_label, {
+        params: { workflowId: saved.id, workflowName: saved.name, values },
+        workflowName: saved.name,
+      })
       const base: LedgerRecord = {
         runLabel,
         params: { workflowId: saved.id, workflowName: saved.name, values },
@@ -1174,7 +1294,6 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
         ts: new Date().toISOString(),
         status: 'queued',
       }
-      upsertRun(runDir, base)
 
       const startedAt = Date.now()
       let promptId: string
@@ -1187,6 +1306,13 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
           values,
         })
       } catch (error) {
+        // A refusal from the submit throat is recorded as its own code, so a
+        // caller can tell "this graph was rejected" from "the submit broke".
+        const refusal = preflightRefusalFailure(error)
+        if (refusal !== undefined) {
+          upsertRun(runDir, { ...base, status: 'failed', durationMs: Date.now() - startedAt, error: refusal })
+          return { action: 'run', id, workflowName: saved.name, runLabel, error: refusal }
+        }
         const failure: RunFailure = {
           code: 'SUBMIT_FAILED',
           message: error instanceof Error ? error.message : String(error),
@@ -1198,10 +1324,7 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
       const record: LedgerRecord = { ...base, promptId }
 
       if (mode === 'async') {
-        const jobs = ctx.get('jobs') as JobsService | undefined
-        if (jobs === undefined) {
-          throw new Error('comfyui_workflow: background jobs unavailable — load @deepseek-ai/dsh-jobs-local and @deepseek-ai/dsh-tool-jobs')
-        }
+        const jobs = ctx.get('jobs') as JobsService
         const jobId = jobs.start({
           kind: 'comfyui',
           label: saved.name,
@@ -1273,6 +1396,22 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
 }
 
 /**
+ * The runtime one registered tool is wired to.
+ *
+ * The tools are the only handle a caller gets on the runtime, and the checks
+ * that matter most — the submit-time preflight in `ComfyUIRuntime.queue`, for
+ * one — live on the runtime rather than in any tool definition, so the self
+ * checks cannot reach them from the tool surface alone. Reading the tag
+ * `comfyUIToolDefinitions` applies keeps that one source instead of a second
+ * runtime assembled in a test harness, which would drift from the real one.
+ */
+export function introspectComfyUIRuntime(tool: ToolDefinition | { name: string }): ComfyUIRuntime {
+  const runtime = (tool as ToolDefinition).runtime
+  if (runtime === undefined) throw new Error(`tool "${(tool as { name: string }).name}" is not wired to a runtime`)
+  return runtime
+}
+
+/**
  * `comfyui_skill`: read and write one workflow's skill pack.
  *
  * The pack is documentation the agent is expected to consult before running a
@@ -1300,9 +1439,17 @@ function skillDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
-      // Closed deliberately: the host does not validate `parameters` at
-      // register time, so a misspelled argument is only caught if the schema
-      // refuses it. Without this the call silently runs with the field ignored.
+      // Closed deliberately, for two reasons that are still true: it documents
+      // the exact argument surface, and it is what the PTC SDK rendering
+      // (`jsonSchemaToTs`) turns into the tool's input type. It does NOT make
+      // a misspelled argument fail: the host never validates a raw-channel
+      // `parameters` — not at register time (`dsh-tools` only runs
+      // `assertSupportedJsonSchema` on `output.schema`) and not at call time
+      // (only the returned value is validated). The real risk runs the other
+      // way: if a keyword here is outside the host's supported subset, that
+      // PTC rendering throws, the failure is swallowed, and this tool's input
+      // type silently degrades to `unknown`. Enforcement of the declared key
+      // set lives in `execute` (see `undeclaredArgumentFailure`).
       additionalProperties: false,
       properties: {
         action: {
@@ -1359,6 +1506,10 @@ function skillDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     async execute(args, exec) {
       const action = args.action
       const id = args.workflow_id
+      const undeclaredArgs = undeclaredArgumentFailure(this, args)
+      if (undeclaredArgs !== undefined) {
+        return { action: 'rejected', workflowId: typeof id === 'string' ? id : '', error: undeclaredArgs }
+      }
       if (typeof id !== 'string' || id === '') {
         throw new Error('comfyui_skill: workflow_id is required')
       }
@@ -1515,9 +1666,17 @@ function probeDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
-      // Closed deliberately: the host does not validate `parameters` at
-      // register time, so a misspelled argument is only caught if the schema
-      // refuses it. Without this the call silently runs with the field ignored.
+      // Closed deliberately, for two reasons that are still true: it documents
+      // the exact argument surface, and it is what the PTC SDK rendering
+      // (`jsonSchemaToTs`) turns into the tool's input type. It does NOT make
+      // a misspelled argument fail: the host never validates a raw-channel
+      // `parameters` — not at register time (`dsh-tools` only runs
+      // `assertSupportedJsonSchema` on `output.schema`) and not at call time
+      // (only the returned value is validated). The real risk runs the other
+      // way: if a keyword here is outside the host's supported subset, that
+      // PTC rendering throws, the failure is swallowed, and this tool's input
+      // type silently degrades to `unknown`. Enforcement of the declared key
+      // set lives in `execute` (see `undeclaredArgumentFailure`).
       additionalProperties: false,
       properties: {
         host: { type: 'string', description: 'Override the target host (default: the configured ComfyUI server).' },
@@ -1590,6 +1749,11 @@ function probeDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     },
     timeoutMs: 120_000,
     async execute(args) {
+      // `output.schema` here is closed and has no refusable shape, so the
+      // refusal is thrown with the same code in it rather than faked as an
+      // unreachable server — a probe that never ran is not a probe result.
+      const undeclaredArgs = undeclaredArgumentFailure(this, args)
+      if (undeclaredArgs !== undefined) throw new Error(undeclaredArgs.message)
       const client = clientFor(runtime, await runtime.getApiKey(), args)
       const ts = new Date().toISOString()
       try {
@@ -1655,9 +1819,17 @@ function fetchOutputDefinition(runtime: ComfyUIRuntime): ToolDefinition {
     ].join(' '),
     parameters: {
       type: 'object',
-      // Closed deliberately: the host does not validate `parameters` at
-      // register time, so a misspelled argument is only caught if the schema
-      // refuses it. Without this the call silently runs with the field ignored.
+      // Closed deliberately, for two reasons that are still true: it documents
+      // the exact argument surface, and it is what the PTC SDK rendering
+      // (`jsonSchemaToTs`) turns into the tool's input type. It does NOT make
+      // a misspelled argument fail: the host never validates a raw-channel
+      // `parameters` — not at register time (`dsh-tools` only runs
+      // `assertSupportedJsonSchema` on `output.schema`) and not at call time
+      // (only the returned value is validated). The real risk runs the other
+      // way: if a keyword here is outside the host's supported subset, that
+      // PTC rendering throws, the failure is swallowed, and this tool's input
+      // type silently degrades to `unknown`. Enforcement of the declared key
+      // set lives in `execute` (see `undeclaredArgumentFailure`).
       additionalProperties: false,
       properties: {
         promptId: { type: 'string', description: 'Download every output of this prompt (from GET /history/<promptId>). Alternative to `filename`.' },
@@ -1742,6 +1914,13 @@ function fetchOutputDefinition(runtime: ComfyUIRuntime): ToolDefinition {
         ledger: { file: join(runDir, 'runs.json'), records: 0, note: null },
         error: { code, message },
       })
+      // The refusal rides the existing structured error shape, so a caller sees
+      // one error vocabulary (`code` + `message`) for both a bad target and an
+      // argument the tool never declared.
+      const undeclaredArgs = undeclaredArgumentFailure(this, args)
+      if (undeclaredArgs !== undefined) {
+        return fail(undeclaredArgs.code, undeclaredArgs.message, null)
+      }
       if (hasPrompt === hasFilename) {
         return fail('BAD_ARGS', 'promptId 与 filename 二选一：给且仅给一个', null)
       }
@@ -1805,7 +1984,7 @@ function fetchOutputDefinition(runtime: ComfyUIRuntime): ToolDefinition {
  * quietly stop covering a tool the moment one was added.
  */
 export function comfyUIToolDefinitions(ctx: Context, runtime: ComfyUIRuntime): ToolDefinition[] {
-  return [
+  const definitions: ToolDefinition[] = [
     runDefinition(runtime, ctx),
     objectInfoDefinition(runtime),
     workflowDefinition(runtime, ctx),
@@ -1813,6 +1992,10 @@ export function comfyUIToolDefinitions(ctx: Context, runtime: ComfyUIRuntime): T
     probeDefinition(runtime),
     fetchOutputDefinition(runtime),
   ]
+  // One runtime, one source: tagging the definitions here beats re-deriving
+  // the runtime in every caller that needs it (tools, routes, self-checks).
+  for (const definition of definitions) definition.runtime = runtime
+  return definitions
 }
 
 /** Register the plugin tools; returns disposers. */

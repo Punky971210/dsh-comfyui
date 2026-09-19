@@ -13,6 +13,7 @@
  * server-side file — a model that is not on disk is reported, never obtained.
  */
 import type { ComfyUIHistoryEntry } from './comfyui.js'
+import type { Workflow } from './params.js'
 
 /** Node-input spec shapes as `object_info` reports them. */
 interface NodeDefinition {
@@ -29,6 +30,8 @@ export interface PreflightProblem {
   inputKey?: string
   /** The value that is not available on the server (model name / option). */
   value?: string
+  /** The values the server DOES report for that input (truncated for display). */
+  available?: string[]
   code: 'UNKNOWN_CLASS' | 'MISSING_VALUE'
   message: string
 }
@@ -131,6 +134,7 @@ export function preflightWorkflow(
         classType,
         inputKey,
         value: raw,
+        available: options.slice(0, MAX_REPORTED_VALUES),
         code: 'MISSING_VALUE',
         // The refusal is the whole point of the red line: the value is missing
         // on disk, and listing the available ones is what lets the caller fix
@@ -167,11 +171,128 @@ export function preflightFailure(result: PreflightResult, runDir: string): RunFa
     reason: problem.code,
   }))
   const head = result.problems.slice(0, 3).map((problem) => `${problem.nodeId}.${problem.classType}${problem.inputKey !== undefined ? `.${problem.inputKey}` : ''}`)
+  const detail = failureDetail(result.problems)
   return {
     code: 'PREFLIGHT',
-    message: `提交前预检未通过（${result.problems.length} 项）: ${head.join('; ')}${result.problems.length > head.length ? ' …' : ''}。模型/节点未就位时不会提交、也不会自动下载；补齐后重试。台账目录: ${runDir}`,
+    // The missing value and the values that ARE available go into the message
+    // itself, not only into `nodeErrors`: callers that surface a plain string
+    // (the panel routes, for one) would otherwise answer "refused" without
+    // saying what to fix, which is the state the operator cannot act on.
+    message: `提交前预检未通过（${result.problems.length} 项）: ${head.join('; ')}${result.problems.length > head.length ? ' …' : ''}。模型/节点未就位时不会提交、也不会自动下载；补齐后重试。${detail !== '' ? `\n${detail}` : ''}\n台账目录: ${runDir}`,
     nodeErrors,
   }
+}
+
+/** One line per refused problem: what is missing and what IS available. */
+function failureDetail(problems: PreflightProblem[]): string {
+  return problems.slice(0, 3).map((problem) => {
+    if (problem.code === 'UNKNOWN_CLASS') return `  ${problem.nodeId}: 节点类型 "${problem.classType}" 未注册`
+    const available = problem.available ?? []
+    const shown = available.length > 0
+      ? `（服务端可选: ${available.join(', ')}${available.length >= MAX_REPORTED_VALUES ? ' …' : ''}）`
+      : '（服务端未声明该输入的取值清单）'
+    return `  ${problem.nodeId}(${problem.classType}).${problem.inputKey} = "${problem.value ?? ''}" 不在可用值内${shown}`
+  }).join('\n')
+}
+
+/**
+ * A refusal carried across a module boundary as a thrown `Error`.
+ *
+ * The submit throat (`ComfyUIRuntime.queue`) cannot return a value the way the
+ * tools do, because its callers treat the returned promise's rejection as "this
+ * did not happen". The refusal therefore rides a thrown error, and callers
+ * classify it by `code` rather than by reading the message: a translation table
+ * on a human-readable string would silently rot the first time the wording
+ * changed, while `code` is the same field the structured refusal already ships.
+ */
+export class PreflightRefusal extends Error {
+  /** `PREFLIGHT` (a gap in the workflow) or `PREFLIGHT_UNAVAILABLE` (no snapshot). */
+  readonly code: string
+  /** The structured refusal (`code`, `message`, `nodeErrors`) callers record. */
+  readonly failure: RunFailure
+
+  constructor(failure: RunFailure) {
+    super(failure.message)
+    this.name = 'PreflightRefusal'
+    this.code = failure.code
+    this.failure = failure
+  }
+}
+
+/**
+ * Whether a thrown value is a preflight refusal, by code (not by `instanceof`,
+ * which does not survive a duplicated module instance) and never by message.
+ */
+export function isPreflightRefusal(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  return code === 'PREFLIGHT' || code === 'PREFLIGHT_UNAVAILABLE'
+}
+
+/** The structured refusal carried by a preflight error, when it is one. */
+export function preflightRefusalFailure(error: unknown): RunFailure | undefined {
+  if (!isPreflightRefusal(error)) return undefined
+  const failure = (error as { failure?: unknown }).failure
+  if (typeof failure === 'object' && failure !== null && typeof (failure as RunFailure).code === 'string') {
+    return failure as RunFailure
+  }
+  return {
+    code: String((error as { code: unknown }).code),
+    message: error instanceof Error ? error.message : String(error),
+    nodeErrors: null,
+  }
+}
+
+/**
+ * The `object_info` snapshot, or a structured refusal when the server cannot
+ * provide one — never `undefined`. This is the single place that decides
+ * "the definitions could not be read" means "refuse"; returning a snapshot to
+ * the caller would let one code path quietly skip every check.
+ */
+export async function requireObjectInfo(
+  fetch: () => Promise<Record<string, unknown>>,
+): Promise<{ ok: true; objectInfo: Record<string, unknown>; failure: null } | { ok: false; objectInfo: null; failure: RunFailure }> {
+  try {
+    return { ok: true, objectInfo: await fetch(), failure: null }
+  } catch (error) {
+    const cause = error instanceof Error ? error.message : String(error)
+    return { ok: false, objectInfo: null, failure: preflightUnavailable(cause) }
+  }
+}
+
+/**
+ * The one submit-time check every path goes through: fetch the definitions and
+ * evaluate the **final** workflow (parameters already applied) against them.
+ * Throws `PreflightRefusal` on either a gap or an unreadable snapshot, so no
+ * caller can submit past it.
+ */
+export async function preflightApproved(
+  workflow: Workflow,
+  fetch: () => Promise<Record<string, unknown>>,
+  runDir: string,
+): Promise<Record<string, unknown>> {
+  const snapshot = await requireObjectInfo(fetch)
+  if (!snapshot.ok) throw new PreflightRefusal(snapshot.failure)
+  const result = preflightWorkflow(workflow as unknown as Record<string, { class_type: string; inputs: Record<string, unknown> }>, snapshot.objectInfo)
+  if (!result.ok) throw new PreflightRefusal(preflightFailure(result, runDir))
+  return snapshot.objectInfo
+}
+
+/**
+ * The argument keys a caller passed that the tool never declares.
+ *
+ * The raw `ctx.tools.register` channel is not validated by the host — not at
+ * registration and not at call time (`dsh-tools` only checks `output.schema` at
+ * registration and the returned value afterwards), so `additionalProperties:
+ * false` on `parameters` is documentation plus the PTC type-rendering surface,
+ * not enforcement. This helper is the enforcement: an undeclared key is a typo
+ * the model cannot recover from once the field is silently ignored.
+ */
+export function undeclaredArgumentKeys(parameters: Record<string, unknown>, args: unknown): string[] {
+  if (typeof args !== 'object' || args === null || Array.isArray(args)) return []
+  const declared = parameters['properties']
+  if (typeof declared !== 'object' || declared === null) return []
+  const known = new Set(Object.keys(declared))
+  return Object.keys(args as Record<string, unknown>).filter((key) => !known.has(key))
 }
 
 /**
