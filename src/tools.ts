@@ -318,6 +318,27 @@ function undeclaredArgumentFailure(tool: ToolDefinition, args: Record<string, un
   }
 }
 
+/**
+ * The caller's workflow, as a graph this run may write into.
+ *
+ * The host freezes the arguments of a tool call (`snapshotJsonValue` →
+ * `deepFreeze` in `dsh-tools`), and `resolveSeeds` / the placeholder injection
+ * both write into the graph before it is submitted. Returning `args.workflow`
+ * itself therefore handed a read-only object to a writer: any inline workflow
+ * that carried a numeric seed died with `TypeError: Cannot assign to read only
+ * property 'seed'`, and anything that survived was mutated in the caller's
+ * snapshot. Every path out of here is a CLONE — the caller's object is never
+ * the object this run works on.
+ *
+ * `structuredClone` rather than the JSON round trip `cloneWorkflow` uses: the
+ * graph is JSON by contract, and a structured clone preserves values a JSON
+ * round trip would silently rewrite (`undefined`, `NaN`, `Infinity`, sparse
+ * arrays). `src/params.ts` already clones workflows this way.
+ */
+function cloneCallerWorkflow(workflow: Record<string, unknown>): Record<string, { class_type: string; inputs: Record<string, unknown> }> {
+  return structuredClone(workflow) as Record<string, { class_type: string; inputs: Record<string, unknown> }>
+}
+
 function buildWorkflow(args: Record<string, unknown>): { workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>; label: string } {
   const template = args.template
   if (typeof template === 'string') {
@@ -339,14 +360,17 @@ function buildWorkflow(args: Record<string, unknown>): { workflow: Record<string
   if (typeof workflow !== 'object' || workflow === null) {
     throw new Error('comfyui_run: workflow must be an object')
   }
+  // Clone FIRST: everything below (the `inputs` merge here, then seed
+  // resolution in `preflightRun`, then the placeholder injection) writes.
+  const clone = cloneCallerWorkflow(workflow as Record<string, unknown>)
   const inputs = args.inputs
   if (inputs !== undefined) {
     if (typeof inputs !== 'object' || inputs === null) {
       throw new Error('comfyui_run: inputs must be an object keyed by node id')
     }
-    applyTemplateInputs(workflow as Record<string, { class_type: string; inputs: Record<string, unknown> }>, inputs as Record<string, Record<string, unknown>>)
+    applyTemplateInputs(clone, inputs as Record<string, Record<string, unknown>>)
   }
-  return { workflow: workflow as Record<string, { class_type: string; inputs: Record<string, unknown> }>, label: 'comfyui custom workflow' }
+  return { workflow: clone, label: 'comfyui custom workflow' }
 }
 
 function summarizeMedia(media: RunMediaItem[]): string {

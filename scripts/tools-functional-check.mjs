@@ -14,7 +14,7 @@
  */
 import { createServer } from 'node:http'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const DSH_TOOLS = 'file:///D:/dsh/npm/0.1.6-alpha.1/node_modules/@deepseek-ai/dsh-tools/lib/index.js'
@@ -903,9 +903,11 @@ assert('N-21 preflightApproved is gone from both src/ and lib/',
 // own fallback so none of them can pass a possibly-empty string through as the
 // message.
 let rectSubmissions = 0
-/** What the mock's history says: failed without detail, or failed with one. */
+/** What the mock's history says: success, or failed with/without detail. */
 let rectHistoryMode = 'bare'
-const rectServer = createServer((request, response) => {
+/** The graph bodies sent to `/prompt`, in submission order. */
+const rectSubmitted = []
+const rectServer = createServer(async (request, response) => {
   const url = new URL(request.url ?? '/', 'http://127.0.0.1')
   const json = (body) => {
     response.writeHead(200, { 'content-type': 'application/json' })
@@ -917,11 +919,22 @@ const rectServer = createServer((request, response) => {
   if (url.pathname === '/object_info') return json(OBJECT_INFO)
   if (url.pathname === '/queue') return json({ queue_running: [], queue_pending: [] })
   if (url.pathname === '/prompt') {
+    let raw = ''
+    for await (const chunk of request) raw += chunk
+    rectSubmitted.push(JSON.parse(raw).prompt)
     rectSubmissions += 1
     return json({ prompt_id: `rect-prompt-${rectSubmissions}` })
   }
   if (url.pathname.startsWith('/history/')) {
     const promptId = decodeURIComponent(url.pathname.slice('/history/'.length))
+    if (rectHistoryMode === 'success') {
+      return json({
+        [promptId]: {
+          status: { status_str: 'success', completed: true },
+          outputs: { '7': { images: [{ filename: 'rect.png', subfolder: '', type: 'output' }] } },
+        },
+      })
+    }
     const messages = rectHistoryMode === 'detailed'
       ? [['execution_error', { node_id: '3', node_type: 'KSampler', exception_message: 'RECT-REAL-ERROR-TEXT' }]]
       : []
@@ -978,6 +991,109 @@ assert('F-4 the failure waitAndRecord recorded is handed to the caller whole (sy
   JSON.stringify({
     async: (toolsSource.match(/error: state\.failure,/g) ?? []).length,
     sync: (toolsSource.match(/error: terminal\.failure \?\?/g) ?? []).length,
+  }))
+
+// --- F-1/F-2/F-3 (rectify segment 2, P2): the caller's graph is never written
+// The host freezes a tool call's arguments (`dsh-tools`: `snapshotJsonValue` →
+// `deepFreeze`), and the run writes into the graph before submitting it (the
+// `inputs` merge, seed resolution, later the placeholder injection). These
+// cases hand over a graph frozen the same way and check three things at once:
+// the call does not throw, the submitted graph carries the resolved values, and
+// the caller's own object is untouched afterwards.
+const RECIPES_ROOT = join(homedir(), '.agents', 'skills', 'Comfyui-use', 'recipes')
+/** The recipe card's own file — never retyped here, so the fixture cannot drift. */
+function readRecipeWorkflow(recipe) {
+  return JSON.parse(readFileSync(join(RECIPES_ROOT, recipe, `${recipe}.workflow.json`), 'utf8'))
+}
+/** Recursive `Object.freeze`, i.e. what `deepFreeze` does to the arguments. */
+function deepFreeze(value) {
+  if (value !== null && typeof value === 'object') {
+    for (const key of Object.keys(value)) deepFreeze(value[key])
+    Object.freeze(value)
+  }
+  return value
+}
+/** Whether every object in the tree is still frozen (the clone was the writer). */
+function stillFrozen(value) {
+  if (value === null || typeof value !== 'object') return true
+  return Object.isFrozen(value) && Object.values(value).every(stillFrozen)
+}
+/**
+ * The poster card as a caller who pinned the model and the seed hands it over:
+ * the recipe file itself, with the two values that preflight and seed
+ * resolution read as concrete ones written down. Without a NUMBER in a seed
+ * slot the old code never wrote, so the freeze bug would not reproduce. (The
+ * raw placeholder form of this card is covered by the F-7..F-22 cases, which
+ * need the `params` channel to be filled.)
+ */
+function posterCardWithNumericSeed() {
+  const graph = readRecipeWorkflow('poster-sdxl-base')
+  graph['1'].inputs.ckpt_name = 'sd_xl_base_1.0.safetensors'
+  graph['5'].inputs.seed = 0
+  return graph
+}
+
+rectHistoryMode = 'success'
+rectSubmitted.length = 0
+
+const frozenCard = deepFreeze(posterCardWithNumericSeed())
+const frozenBefore = JSON.stringify(frozenCard)
+let frozenRun
+try {
+  frozenRun = await rectMount.toolFor('comfyui_run').execute({ workflow: frozenCard, run_label: 'rect-p2-frozen-0001' }, exec)
+} catch (error) {
+  frozenRun = { threw: error }
+}
+assert('F-1 a deeply frozen inline graph with a numeric seed is accepted (no TypeError)',
+  frozenRun.threw === undefined && frozenRun.status === 'completed',
+  JSON.stringify({ threw: String(frozenRun.threw ?? ''), status: frozenRun.status, error: frozenRun.error ?? null }))
+assert('F-1 the submitted graph is the run\'s own object, with the seed written into it',
+  rectSubmitted.length === 1 && rectSubmitted[0]['5'].inputs.seed === 0,
+  JSON.stringify(rectSubmitted[0]?.['5']?.inputs ?? null))
+assert('F-1 the caller\'s frozen graph is byte-identical and still frozen after the call',
+  JSON.stringify(frozenCard) === frozenBefore && stillFrozen(frozenCard),
+  JSON.stringify({ same: JSON.stringify(frozenCard) === frozenBefore, frozen: stillFrozen(frozenCard) }))
+
+const frozenOverridden = deepFreeze(posterCardWithNumericSeed())
+const overriddenBefore = JSON.stringify(frozenOverridden)
+let overriddenRun
+try {
+  overriddenRun = await rectMount.toolFor('comfyui_run').execute({
+    workflow: frozenOverridden,
+    inputs: { '4': { width: 768 } },
+    run_label: 'rect-p2-frozen-0002',
+  }, exec)
+} catch (error) {
+  overriddenRun = { threw: error }
+}
+assert('F-2 a frozen graph plus an `inputs` override neither throws nor leaks the merge',
+  overriddenRun.threw === undefined && overriddenRun.status === 'completed'
+  && rectSubmitted[1]?.['4']?.inputs?.width === 768
+  && rectSubmitted[1]?.['4']?.inputs?.height === '<height: 1536>',
+  JSON.stringify({ threw: String(overriddenRun.threw ?? ''), node4: rectSubmitted[1]?.['4']?.inputs ?? null }))
+assert('F-2 the frozen override target is unchanged in the caller\'s graph',
+  JSON.stringify(frozenOverridden) === overriddenBefore && frozenOverridden['4'].inputs.width === '<width: 1024>',
+  JSON.stringify({ same: JSON.stringify(frozenOverridden) === overriddenBefore, width: frozenOverridden['4'].inputs.width }))
+
+const frozenSeeded = deepFreeze(posterCardWithNumericSeed())
+const seededBefore = JSON.stringify(frozenSeeded)
+let seededRun
+try {
+  seededRun = await rectMount.toolFor('comfyui_run').execute({ workflow: frozenSeeded, seed: 12345, run_label: 'rect-p2-frozen-0003' }, exec)
+} catch (error) {
+  seededRun = { threw: error }
+}
+const seededRow = rectRows().find((entry) => entry.runLabel === 'rect-p2-frozen-0003')
+assert('F-3 a frozen graph plus a top-level seed neither throws nor writes back',
+  seededRun.threw === undefined && rectSubmitted[2]?.['5']?.inputs?.seed === 12345
+  && seededRun.seed === 12345 && seededRow?.seed === 12345
+  && JSON.stringify(frozenSeeded) === seededBefore,
+  JSON.stringify({
+    threw: String(seededRun.threw ?? ''),
+    submitted: rectSubmitted[2]?.['5']?.inputs?.seed ?? null,
+    seed: seededRun.seed ?? null,
+    row: seededRow?.seed ?? null,
+    same: JSON.stringify(frozenSeeded) === seededBefore,
   }))
 
 rectMount.dispose()
