@@ -195,6 +195,12 @@ export interface RunResult {
   ledger: string | null
   /** Present when the run was refused or failed before/while executing. */
   error: RunFailure | null
+  /**
+   * Something went wrong after the execution itself succeeded (retrieving the
+   * media, writing the ledger row). `status` stays `completed` in that case:
+   * the output really was produced, and a `failed` row would deny it.
+   */
+  notice: string | null
 }
 
 /** Background mode result: collect later with job_output. */
@@ -676,6 +682,9 @@ function renderRunResult(_args: unknown, value: unknown): unknown[] {
       lines.push(`    node ${node.node} (${node.classType}).${node.input}: ${node.reason}`)
     }
   }
+  // A completed run whose retrieval failed still produced output; saying so
+  // beside the status keeps a readable line from reading as a clean run.
+  if (result.notice !== null && result.notice !== undefined) lines.push(`  notice: ${result.notice}`)
   if (result.seed !== null) {
     const distinct = [...new Set(Object.values(result.seeds ?? {}))]
     lines.push(`  seed: ${result.seed}${distinct.length > 1 ? ` (${JSON.stringify(result.seeds)})` : ''} — 已写入台账，可复跑`)
@@ -721,6 +730,13 @@ type TerminalState = {
   durationMs: number
   errors: RunFailure['nodeErrors']
   failure: RunFailure | null
+  /**
+   * Something went wrong AFTER the execution itself succeeded (collecting the
+   * media, writing the row). Carried separately from `failure` on purpose: the
+   * run is not a failure, and saying it was is how a finished image ends up
+   * recorded as `failed`.
+   */
+  notice: string | null
 }
 
 /**
@@ -744,30 +760,26 @@ async function waitAndRecord(
   onTerminal: (state: TerminalState) => void,
 ): Promise<ComfyUIHistoryEntry | undefined> {
   const startedAt = Date.now()
+  let entry: ComfyUIHistoryEntry
   try {
-    const entry = await client.waitForCompletion({
+    entry = await client.waitForCompletion({
       promptId,
       timeoutMs: timeoutMs ?? config.timeoutMs,
       pollIntervalMs: config.pollIntervalMs,
       signal,
     })
-    const media = collectMedia({ promptId, entry, maxItems: config.maxMediaItems, proxyBase: runtime.proxyBase() })
-    const durationMs = Date.now() - startedAt
-    upsertRun(runDir, { ...record, promptId, status: 'completed', durationMs, media: ledgerFiles(media) })
-    onTerminal({ status: 'completed', media, durationMs, errors: null, failure: null })
-    return entry
   } catch (error) {
     runtime.untrack(promptId)
     const durationMs = Date.now() - startedAt
     if (error instanceof Error && error.name === 'ComfyUIError' && error.message.includes('interrupted')) {
       upsertRun(runDir, { ...record, promptId, status: 'interrupted', durationMs })
-      onTerminal({ status: 'interrupted', media: [], durationMs, errors: null, failure: null })
+      onTerminal({ status: 'interrupted', media: [], durationMs, errors: null, failure: null, notice: null })
       return undefined
     }
     // A failed run is a terminal state too: the row is closed out with the
     // node-level detail ComfyUI reported, so it is not left reading "queued".
-    const entry = await client.getHistory(promptId).catch(() => undefined)
-    const errors = extractNodeErrors(entry)
+    const history = await client.getHistory(promptId).catch(() => undefined)
+    const errors = extractNodeErrors(history)
     const failure: RunFailure = {
       code: 'EXECUTION_FAILED',
       message: firstErrorText(errors) || (error instanceof Error ? error.message : String(error)),
@@ -780,9 +792,43 @@ async function waitAndRecord(
     // that reassembles the message out of `errors` alone silently replaces the
     // real cause with a placeholder, which is how the tool result and its
     // ledger row came to disagree about the same run.
-    onTerminal({ status: 'error', media: [], durationMs, errors, failure })
-    return entry
+    onTerminal({ status: 'error', media: [], durationMs, errors, failure, notice: null })
+    return history
   }
+  // The execution is DONE — ComfyUI accepted the prompt and finished it. What
+  // is left is retrieval and bookkeeping, and a failure in either of those is
+  // not a failure of the run: the output exists on the server, and a row
+  // reading `failed` would deny an image that is sitting in the output
+  // directory. Both are therefore caught here, reported as a `notice` beside a
+  // completed status, and the caller gets the real state either way.
+  const durationMs = Date.now() - startedAt
+  let media: RunMediaItem[] = []
+  let notice: string | null = null
+  try {
+    media = collectMedia({ promptId, entry, maxItems: config.maxMediaItems, proxyBase: runtime.proxyBase() })
+    upsertRun(runDir, { ...record, promptId, status: 'completed', durationMs, media: ledgerFiles(media) })
+  } catch (error) {
+    notice = `执行已完成，但取件/记账失败: ${error instanceof Error ? error.message : String(error)}`
+    runtime.untrack(promptId)
+    // Best effort: even the notice may not be recordable (that is one of the
+    // failures this branch exists for), and the run must still be reported as
+    // the success it was rather than thrown away. `error` carries the reason
+    // while `status` stays `completed` — the pair is the point: the code says
+    // what went wrong, the status says the run itself was not what failed.
+    try {
+      upsertRun(runDir, {
+        ...record,
+        promptId,
+        status: 'completed',
+        durationMs,
+        error: { code: 'POST_PROCESS_FAILED', message: notice },
+      })
+    } catch {
+      // Swallowed on purpose: the caller is told through `notice`.
+    }
+  }
+  onTerminal({ status: 'completed', media, durationMs, errors: null, failure: null, notice })
+  return entry
 }
 
 /**
@@ -841,6 +887,7 @@ function emptyResult(runLabel: string, runDir: string | null, failure: RunFailur
     seeds: null,
     ledger: runDir,
     error: failure,
+    notice: null,
   }
 }
 
@@ -1039,6 +1086,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
           seeds: Object.keys(seeds).length > 0 ? seeds : null,
           ledger: runDir,
           error: failure,
+          notice: null,
         }
       }
       // Seed and prefixes are written into the submitted graph before submit,
@@ -1072,6 +1120,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
                       seeds: Object.keys(seeds).length > 0 ? seeds : null,
                       ledger: runDir,
                       error: state.failure,
+                      notice: state.notice,
                     }
                   },
                 )
@@ -1104,7 +1153,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
 
       let outcome: TerminalState | undefined
       await waitAndRecord(runtime, client, promptId, config, exec.signal, waitMs, base, runDir, (state) => { outcome = state })
-      const terminal: TerminalState = outcome ?? { status: 'error', media: [], durationMs: Date.now() - startedAt, errors: null, failure: null }
+      const terminal: TerminalState = outcome ?? { status: 'error', media: [], durationMs: Date.now() - startedAt, errors: null, failure: null, notice: null }
       return {
         kind: 'sync',
         promptId,
@@ -1121,6 +1170,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
           message: firstErrorText(terminal.errors) || (terminal.status === 'interrupted' ? 'interrupted before completion' : 'unknown error'),
           nodeErrors: terminal.errors,
         }),
+        notice: terminal.notice,
       }
     },
   }
@@ -1630,6 +1680,7 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
                       seeds: null,
                       ledger: runDir,
                       error: state.failure,
+                      notice: state.notice,
                     }
                   },
                 )
@@ -1659,7 +1710,7 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
       }
       let outcome: TerminalState | undefined
       await waitAndRecord(runtime, client, promptId, config, exec.signal, waitMs, record, runDir, (state) => { outcome = state })
-      const terminal: TerminalState = outcome ?? { status: 'error', media: [], durationMs: Date.now() - startedAt, errors: null, failure: null }
+      const terminal: TerminalState = outcome ?? { status: 'error', media: [], durationMs: Date.now() - startedAt, errors: null, failure: null, notice: null }
       const result: RunResult = {
         kind: 'sync',
         promptId,
@@ -1676,6 +1727,7 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
           message: firstErrorText(terminal.errors) || (terminal.status === 'interrupted' ? 'interrupted before completion' : 'unknown error'),
           nodeErrors: terminal.errors,
         }),
+        notice: terminal.notice,
       }
       return { action: 'run', id, workflowName: saved.name, runLabel, result }
     },

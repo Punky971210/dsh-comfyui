@@ -1308,6 +1308,32 @@ assert('F-22 E-5: `params` that is not an object is refused before anything is s
   && noRow('f22a-0001') && noRow('f22b-0001'),
   JSON.stringify({ array: String(f22array.threw?.message ?? ''), scalar: String(f22scalar.threw?.message ?? '') }))
 
+// --- F-P3 (rectify segment 4, P3): a success whose post-processing failed -----
+// The real incident recorded a run as `failed` whose image was on the server and
+// whose `/history` said success. Two defects had to line up: the failure text was
+// replaced by a placeholder (F-4), and ANY throw after the execution — collecting
+// the media, writing the row — was classified as a failed run. This case forces
+// that second throw deterministically (the media proxy base is stubbed to throw,
+// which is the H-1 candidate the spec listed) and pins what the run must report.
+const postProcessRun = (() => {
+  rectHistoryMode = 'success'
+  const original = rectMount.runtime.proxyBase
+  rectMount.runtime.proxyBase = () => { throw new Error('RECT-POST-PROCESS-BOOM') }
+  return rectMount.toolFor('comfyui_run').execute({ template: 'txt2img', run_label: 'rect-p3-postprocess-0001' }, exec)
+    .finally(() => { rectMount.runtime.proxyBase = original })
+})()
+const postProcessResult = await postProcessRun
+const postProcessRow = rectRows().find((entry) => entry.runLabel === 'rect-p3-postprocess-0001')
+assert('F-P3 a throw after a finished execution is NOT reported as a failed run',
+  postProcessResult.status === 'completed' && postProcessResult.error === null
+  && /取件\/记账失败/.test(String(postProcessResult.notice ?? ''))
+  && String(postProcessResult.notice ?? '').includes('RECT-POST-PROCESS-BOOM'),
+  JSON.stringify({ status: postProcessResult.status, error: postProcessResult.error, notice: postProcessResult.notice ?? null }))
+assert('F-P3 the ledger row stays `completed` and carries the post-process reason as its own code',
+  postProcessRow?.status === 'completed' && postProcessRow?.error?.code === 'POST_PROCESS_FAILED'
+  && /RECT-POST-PROCESS-BOOM/.test(String(postProcessRow?.error?.message ?? '')),
+  JSON.stringify({ status: postProcessRow?.status ?? null, error: postProcessRow?.error ?? null }))
+
 rectMount.dispose()
 rectServer.close()
 rmSync(rectMount.dataDir, { recursive: true, force: true })
