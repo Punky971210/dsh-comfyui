@@ -1,7 +1,8 @@
 /**
  * The dsh-comfyui companion skill: canvas analysis and graph→API extraction
- * rules for the model, registered through `ctx.skills.register` (runtime
- * skill, rank 250 — user/project skills can override it).
+ * rules for the model. No longer registered by this plugin's runtime — the
+ * content stays here as the exported `COMFYUI_SKILL` constant, and the local
+ * `comfyui-use` skill carries it now.
  */
 
 export const COMFYUI_SKILL = {

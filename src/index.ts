@@ -16,7 +16,6 @@ import { QueueTracker } from './queue.js'
 import { convertGraphToApi } from './convert.js'
 import { analyzeGraph } from './analyze.js'
 import { ProgressTracker } from './progress.js'
-import { COMFYUI_SKILL } from './skill.js'
 import type { StoredWorkflow } from './store.js'
 import { analyzeWorkflowParameters, applyWorkflowParameters, type Workflow } from './params.js'
 import { PreflightRefusal, preflightFailure, preflightWorkflow, requireObjectInfo } from './preflight.js'
@@ -383,17 +382,8 @@ export async function apply(ctx: Context, entryConfig: Partial<ConfigType>): Pro
     }
   }, 'dsh-comfyui: tools')
 
-  // The companion skill rides the same optional-services pattern: headless
-  // hosts without a skills service simply skip it. Runtime skills register at
-  // rank 250, so project/user skills can override the shipped guidance.
-  ctx.effect(() => {
-    const skills = ctx.get('skills') as { register(skill: unknown): () => void } | undefined
-    if (skills === undefined) return () => {}
-    return skills.register({
-      ...COMFYUI_SKILL,
-      content: COMFYUI_SKILL.content,
-    })
-  }, 'dsh-comfyui: skill')
+  // 伴随技能不再由本插件注册：内容保留为 `src/skill.ts` 的导出常量，
+  // 改由本机 `comfyui-use` 技能承载。
 
   // Routes and the media proxy ride a `webServer` sub-fiber rather than a
   // one-shot `ctx.get` at apply time: loader entries settle concurrently, so
