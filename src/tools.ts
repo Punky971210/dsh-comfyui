@@ -339,13 +339,198 @@ function cloneCallerWorkflow(workflow: Record<string, unknown>): Record<string, 
   return structuredClone(workflow) as Record<string, { class_type: string; inputs: Record<string, unknown> }>
 }
 
-function buildWorkflow(args: Record<string, unknown>): { workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>; label: string } {
+/** A recipe card's placeholder: `<name>` or `<name: default>`, as a whole value. */
+const WHOLE_PLACEHOLDER = /^<([A-Za-z_][A-Za-z0-9_]*)(?::\s*([^>]*))?>$/
+/** The same placeholder appearing inside a larger string (`"a <name> b"`). */
+const EMBEDDED_PLACEHOLDER = /<([A-Za-z_][A-Za-z0-9_]*)>/g
+/** A default-carrying placeholder used as a substring — never legal. */
+const INLINE_DEFAULT_PLACEHOLDER = /<[A-Za-z_][A-Za-z0-9_]*:[^<>]*>/
+
+/** One placeholder occurrence inside the cloned graph. */
+interface PlaceholderSite {
+  nodeId: string
+  inputKey: string
+  /** The authored value, quoted back in the syntax error. */
+  raw: string
+  /** The value IS the placeholder (typed slot) rather than embedding one. */
+  whole: boolean
+  name: string
+  /** Raw default text; `undefined` when the placeholder declares none. */
+  fallback: string | undefined
+}
+
+/** A `params` value after the default's type rules have been applied to it. */
+interface ResolvedPlaceholder {
+  value: string | number | boolean
+}
+
+function placeholderSyntaxFailure(site: Omit<PlaceholderSite, 'name' | 'fallback' | 'whole'>): Error {
+  return new Error(
+    `comfyui_run: 占位符语法非法 — node "${site.nodeId}".${site.inputKey} 的值 "${site.raw.slice(0, 80)}" 不匹配 <name> / <name: default>` +
+    `（default 内不得含 '>'；default 形式不得内嵌于字符串）。见 recipes 契约：占位符必须是完整值或字符串内的 <name> 形式。`,
+  )
+}
+
+/**
+ * Every placeholder of a cloned graph, in node order, or a refusal.
+ *
+ * A value that merely CONTAINS `<…>` is only read as a placeholder when it is
+ * either the whole value or holds the plain `<name>` form: a default-carrying
+ * placeholder inside a longer string is refused rather than guessed at, because
+ * "replace this substring" and "compute the default's type" are not the same
+ * operation and silently picking one would inject a wrong value.
+ */
+function collectPlaceholders(workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>): PlaceholderSite[] {
+  const sites: PlaceholderSite[] = []
+  for (const [nodeId, node] of Object.entries(workflow)) {
+    for (const [inputKey, value] of Object.entries(node.inputs ?? {})) {
+      if (typeof value !== 'string') continue
+      const whole = WHOLE_PLACEHOLDER.exec(value)
+      if (whole !== null) {
+        sites.push({ nodeId, inputKey, raw: value, whole: true, name: whole[1]!, fallback: whole[2] })
+        continue
+      }
+      if (INLINE_DEFAULT_PLACEHOLDER.test(value)) {
+        throw placeholderSyntaxFailure({ nodeId, inputKey, raw: value })
+      }
+      // `<>`, `<a: b> c`, a second `>` inside the braces — everything that
+      // announces itself as a placeholder but does not parse as one.
+      if (value.startsWith('<') && value.endsWith('>')) {
+        throw placeholderSyntaxFailure({ nodeId, inputKey, raw: value })
+      }
+      for (const embedded of value.matchAll(EMBEDDED_PLACEHOLDER)) {
+        sites.push({ nodeId, inputKey, raw: value, whole: false, name: embedded[1]!, fallback: undefined })
+      }
+    }
+  }
+  return sites
+}
+
+/** The typed value a `<name: default>` falls back to, from the default's text. */
+function defaultTypedValue(text: string): string | number | boolean {
+  if (/^-?\d+(\.\d+)?$/.test(text)) return Number(text)
+  if (text === 'true') return true
+  if (text === 'false') return false
+  return text
+}
+
+function typeNameOf(value: unknown): string {
+  return value === null ? 'null' : typeof value
+}
+
+/**
+ * Resolve one placeholder name against `params` and the card's own default.
+ *
+ * The default is authoritative about the TYPE, not just the value: a card that
+ * wrote `<cfg: 6.5>` promises a number, so a caller passing `'7.5'` is widened
+ * (a numeric string is unambiguous) while a caller passing an object, a boolean
+ * or a non-numeric string is refused instead of being coerced into a value the
+ * card never promised. A placeholder with no default has no such promise, so
+ * the caller's own type is injected as-is.
+ */
+function resolvePlaceholder(
+  site: PlaceholderSite,
+  params: Record<string, unknown>,
+): ResolvedPlaceholder {
+  if (!Object.prototype.hasOwnProperty.call(params, site.name)) {
+    // A default-less placeholder that reached this point was already refused as
+    // a missing required parameter, so only the default branch can be here.
+    return { value: defaultTypedValue(site.fallback ?? '') }
+  }
+  const passed = params[site.name]
+  if (site.fallback === undefined) return { value: passed as string | number | boolean }
+  const typed = defaultTypedValue(site.fallback)
+  if (typeof passed === typeof typed) return { value: passed as string | number | boolean }
+  if (typeof typed === 'number' && typeof passed === 'string') {
+    const parsed = Number(passed)
+    if (passed.trim() !== '' && Number.isFinite(parsed)) return { value: parsed }
+  }
+  throw new Error(
+    `comfyui_run: 参数类型冲突 — "${site.name}": default "${site.fallback}" 推断为 ${typeNameOf(typed)}，传入 "${String(passed)}" 为 ${typeNameOf(passed)}；` +
+    '数值型默认值接受可解析的数值字符串，其他类型不隐式转换。',
+  )
+}
+
+/**
+ * Fill a recipe card's placeholders from `params` (`<name>` / `<name: default>`),
+ * on the CLONED graph only, and report the names nothing in the graph wanted.
+ *
+ * The write is confined to the placeholder positions: every other input value,
+ * every `class_type`, node key and link array passes through untouched, which is
+ * what lets a card file be submitted verbatim. A leftover placeholder after the
+ * pass is an implementation defect, not a caller error, and is refused as such.
+ */
+function injectPlaceholders(
+  workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>,
+  params: Record<string, unknown>,
+): { ignored: string[] } {
+  const sites = collectPlaceholders(workflow)
+  // Refused as one list, with every location: a card is filled in one call, so
+  // naming one missing parameter at a time would cost one round trip per slot.
+  const absent = [...new Set(sites
+    .filter((site) => site.fallback === undefined && !Object.prototype.hasOwnProperty.call(params, site.name))
+    .map((site) => site.name))]
+  if (absent.length > 0) {
+    const locations = [...new Set(sites
+      .filter((site) => absent.includes(site.name))
+      .map((site) => `node "${site.nodeId}".${site.inputKey}`))]
+    throw new Error(
+      `comfyui_run: 缺少必填参数 — ${absent.map((name) => `"${name}"`).join(', ')}（无默认值占位符，${locations.join('、')}）。` +
+      `本次图中无默认值的占位符：${absent.join(', ')}；请通过 params 传入。`,
+    )
+  }
+  const resolved = new Map<string, ResolvedPlaceholder>()
+  for (const site of sites) {
+    if (resolved.has(site.name)) continue
+    resolved.set(site.name, resolvePlaceholder(site, params))
+  }
+  for (const site of sites) {
+    const value = resolved.get(site.name)!.value
+    workflow[site.nodeId]!.inputs[site.inputKey] = site.whole
+      ? value
+      // An embedded placeholder always lands as text: the surrounding string
+      // fixes the type, so there is nothing to infer.
+      : site.raw.replace(EMBEDDED_PLACEHOLDER, (match, name: string) => {
+        const replacement = resolved.get(name)
+        return replacement === undefined ? match : String(replacement.value)
+      })
+  }
+  const leftover = new Set<string>()
+  for (const node of Object.values(workflow)) {
+    for (const value of Object.values(node.inputs ?? {})) {
+      if (typeof value !== 'string') continue
+      const whole = WHOLE_PLACEHOLDER.exec(value)
+      if (whole !== null) leftover.add(whole[1]!)
+      for (const embedded of value.matchAll(EMBEDDED_PLACEHOLDER)) leftover.add(embedded[1]!)
+    }
+  }
+  if (leftover.size > 0) {
+    throw new Error(`comfyui_run: 注入未收敛 — 仍有占位符残留: ${[...leftover].join(', ')}。这是实现缺陷，请附本条与工作流 JSON 上报。`)
+  }
+  const names = new Set(sites.map((site) => site.name))
+  return { ignored: Object.keys(params).filter((name) => !names.has(name)) }
+}
+
+/** The `params` argument, checked before anything is read out of it. */
+function placeholderParams(args: Record<string, unknown>): Record<string, unknown> {
+  const params = args.params
+  if (params === undefined) return {}
+  if (typeof params !== 'object' || params === null || Array.isArray(params)) {
+    throw new Error('comfyui_run: params must be an object keyed by placeholder name')
+  }
+  return params as Record<string, unknown>
+}
+
+function buildWorkflow(args: Record<string, unknown>): { workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>; label: string; paramsIgnored: string[] } {
+  const params = placeholderParams(args)
   const template = args.template
   if (typeof template === 'string') {
     const found = findTemplate(template)
     if (found === undefined) {
       throw new Error(`comfyui_run: unknown template "${template}" — use one of ${TEMPLATES.map((t) => t.id).join(', ')}`)
     }
+    // Built-in templates carry no placeholders, so `params` injects nothing
+    // here — and refusing it would break every existing template caller.
     const workflow = cloneWorkflow(found.workflow)
     const inputs = args.inputs
     if (inputs !== undefined) {
@@ -354,23 +539,26 @@ function buildWorkflow(args: Record<string, unknown>): { workflow: Record<string
       }
       applyTemplateInputs(workflow, inputs as Record<string, Record<string, unknown>>)
     }
-    return { workflow, label: `comfyui ${template}` }
+    return { workflow, label: `comfyui ${template}`, paramsIgnored: Object.keys(params) }
   }
   const workflow = args.workflow
   if (typeof workflow !== 'object' || workflow === null) {
     throw new Error('comfyui_run: workflow must be an object')
   }
-  // Clone FIRST: everything below (the `inputs` merge here, then seed
-  // resolution in `preflightRun`, then the placeholder injection) writes.
+  // Clone FIRST: everything below (the placeholder injection here, the `inputs`
+  // merge, then seed resolution in `preflightRun`) writes.
   const clone = cloneCallerWorkflow(workflow as Record<string, unknown>)
+  const { ignored } = injectPlaceholders(clone, params)
   const inputs = args.inputs
   if (inputs !== undefined) {
     if (typeof inputs !== 'object' || inputs === null) {
       throw new Error('comfyui_run: inputs must be an object keyed by node id')
     }
+    // `inputs` is the escape hatch that pins one node's input directly, so it
+    // lands after the placeholders and wins on a slot both address.
     applyTemplateInputs(clone, inputs as Record<string, Record<string, unknown>>)
   }
-  return { workflow: clone, label: 'comfyui custom workflow' }
+  return { workflow: clone, label: 'comfyui custom workflow', paramsIgnored: ignored }
 }
 
 function summarizeMedia(media: RunMediaItem[]): string {
@@ -715,6 +903,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
       'Submit a workflow to the configured ComfyUI server and return the generated media (images/videos).',
       'Provide exactly one of `workflow` (ComfyUI API-format object: node id → { class_type, inputs }) or `template` (built-in: txt2img | img2img | video).',
       'Use `inputs` to override node inputs by id, e.g. {"6": {"text": "a red cat"}} for the positive prompt in the templates.',
+      'A recipe card submitted verbatim as `workflow` carries placeholders (`<name>` / `<name: default>`) that `params` fills by name, e.g. {"positive": "a poster", "seed": 7}; a placeholder with no default must be passed, and a name nothing in the graph asks for is ignored. `inputs` is applied after `params` and wins on a slot both address.',
       'Templates: txt2img — 4 checkpoint, 5 EmptyLatentImage (width/height), 6 positive text, 7 negative text, 3 KSampler (seed/steps/cfg/denoise), 9 SaveImage. img2img — 10 LoadImage (image), 11 VAEEncode, 6 text, 3 KSampler (denoise). video — Wan 2.1, needs ComfyUI-WanVideoWrapper custom nodes (10 UNETLoader, 13 WanTextEncode, 14 WanImageToVideo, 15 KSampler, 17 SaveVideo).',
       'Inspect available node types with comfyui_object_info before hand-writing a workflow.',
       'Before anything is submitted the workflow is preflighted against the server node definitions: an unregistered class type, or a loader naming a model that is not on disk, refuses the run with a structured error listing the missing items and the values that ARE available. Nothing is ever downloaded to satisfy a missing model.',
@@ -739,7 +928,8 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
       properties: {
         workflow: { type: 'object', additionalProperties: true, description: 'ComfyUI API-format workflow: node id → { class_type, inputs }. Alternative to `template`.' },
         template: { type: 'string', enum: ['txt2img', 'img2img', 'video'], description: 'Built-in workflow template id. Alternative to `workflow`.' },
-        inputs: { type: 'object', additionalProperties: true, description: 'Per-node input overrides keyed by node id, e.g. {"3": {"seed": 42, "steps": 30}, "6": {"text": "prompt"}}.' },
+        inputs: { type: 'object', additionalProperties: true, description: 'Per-node input overrides keyed by node id, e.g. {"3": {"seed": 42, "steps": 30}, "6": {"text": "prompt"}}. Wins over `params` on a slot both address.' },
+        params: { type: 'object', additionalProperties: true, description: 'Placeholder names of a recipe card (no angle brackets) → values, e.g. {"positive": "a poster", "seed": 7, "width": 1024}. A card value written as `<name>` or `<name: default>` is filled from here: `<name: default>` falls back to its own default when the name is not given (its text sets the injected TYPE — a numeric default also accepts a numeric string), while a placeholder with no default is refused unless a value is passed. Names that no placeholder in the graph asks for are ignored and recorded in the ledger. Applied before `inputs`, which wins on a conflict.' },
         mode: { type: 'string', enum: ['sync', 'async'], default: 'sync', description: 'sync waits and returns media; async returns a background job id.' },
         timeout_ms: { type: 'number', description: 'Generation wait budget in ms (default 180000). Video needs minutes.' },
         seed: { type: 'integer', description: 'One concrete sampling seed for this run, written into every seed input the graph carries and recorded in the ledger (reproducible replay). Explicit here it wins over the graph\'s authored value; omitted, the authored value is kept (the built-in templates default to 0, so pass a seed to vary the result).' },
@@ -783,7 +973,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
       const config = runtime.getConfig()
       const apiKey = await runtime.getApiKey()
       const client = runtime.createClient(apiKey)
-      const { workflow, label } = buildWorkflow(args)
+      const { workflow, label, paramsIgnored } = buildWorkflow(args)
       const waitMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : config.timeoutMs
 
       const requestedSeed = typeof args.seed === 'number' && Number.isFinite(args.seed) && args.seed !== -1
@@ -797,6 +987,11 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
         ...(typeof args.mode === 'string' ? { mode: args.mode } : {}),
         ...(typeof args.timeout_ms === 'number' ? { timeout_ms: args.timeout_ms } : {}),
         node_overrides: args.inputs === undefined ? 0 : Object.keys(args.inputs as Record<string, unknown>).length,
+        // Names handed over that no placeholder in this graph asked for. A
+        // caller reusing one `params` map across recipes is normal, so this is
+        // recorded rather than refused — it is a fact about the run, not the
+        // graph body, which is why it belongs here and not in the workflow.
+        ...(paramsIgnored.length > 0 ? { params_ignored: paramsIgnored } : {}),
       }
       // Identity, queued row, early preflight, seeds — in that order, with the
       // reserve-then-write pair kept inside one synchronous function (B-2).

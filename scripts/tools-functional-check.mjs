@@ -907,6 +907,18 @@ let rectSubmissions = 0
 let rectHistoryMode = 'bare'
 /** The graph bodies sent to `/prompt`, in submission order. */
 const rectSubmitted = []
+// The recipe cards need a few more class types than the templates do. They are
+// declared bare here (a superset of the shared OBJECT_INFO, so no existing case
+// changes meaning): preflight then has nothing to validate on them, which is
+// what these cases want — they are about placeholder injection, not availability.
+const RECT_OBJECT_INFO = {
+  ...OBJECT_INFO,
+  LoadImage: {},
+  Canny: {},
+  ControlNetLoader: {},
+  SetUnionControlNetType: {},
+  ControlNetApplyAdvanced: {},
+}
 const rectServer = createServer(async (request, response) => {
   const url = new URL(request.url ?? '/', 'http://127.0.0.1')
   const json = (body) => {
@@ -916,7 +928,7 @@ const rectServer = createServer(async (request, response) => {
   if (url.pathname === '/system_stats') {
     return json({ system: { comfyui_version: '0.3.99-rectify' }, devices: [{ name: 'cuda:0 NVIDIA Rectify', type: 'cuda', vram_free: 4096 }] })
   }
-  if (url.pathname === '/object_info') return json(OBJECT_INFO)
+  if (url.pathname === '/object_info') return json(RECT_OBJECT_INFO)
   if (url.pathname === '/queue') return json({ queue_running: [], queue_pending: [] })
   if (url.pathname === '/prompt') {
     let raw = ''
@@ -1019,17 +1031,26 @@ function stillFrozen(value) {
   return Object.isFrozen(value) && Object.values(value).every(stillFrozen)
 }
 /**
- * The poster card as a caller who pinned the model and the seed hands it over:
- * the recipe file itself, with the two values that preflight and seed
- * resolution read as concrete ones written down. Without a NUMBER in a seed
- * slot the old code never wrote, so the freeze bug would not reproduce. (The
- * raw placeholder form of this card is covered by the F-7..F-22 cases, which
- * need the `params` channel to be filled.)
+ * The poster card as a caller who is NOT using the params channel hands it
+ * over: read from the recipe file (structure, wiring and node ids all come from
+ * the card), then fully materialised — every placeholder resolved — so these
+ * three cases exercise the clone alone. A NUMBER in a seed slot is required:
+ * without one the old code never wrote, and the freeze bug would not reproduce.
+ * (The raw, placeholder-carrying card is covered by F-7..F-22 instead.)
  */
 function posterCardWithNumericSeed() {
   const graph = readRecipeWorkflow('poster-sdxl-base')
   graph['1'].inputs.ckpt_name = 'sd_xl_base_1.0.safetensors'
+  graph['2'].inputs.text = 'a postcard subject'
+  graph['3'].inputs.text = 'text, watermark'
+  graph['4'].inputs.width = 1024
+  graph['4'].inputs.height = 1536
+  graph['5'].inputs.steps = 24
+  graph['5'].inputs.cfg = 6.5
+  graph['5'].inputs.sampler_name = 'euler'
+  graph['5'].inputs.scheduler = 'normal'
   graph['5'].inputs.seed = 0
+  graph['7'].inputs.filename_prefix = 'rect-p2'
   return graph
 }
 
@@ -1069,10 +1090,10 @@ try {
 assert('F-2 a frozen graph plus an `inputs` override neither throws nor leaks the merge',
   overriddenRun.threw === undefined && overriddenRun.status === 'completed'
   && rectSubmitted[1]?.['4']?.inputs?.width === 768
-  && rectSubmitted[1]?.['4']?.inputs?.height === '<height: 1536>',
+  && rectSubmitted[1]?.['4']?.inputs?.height === 1536,
   JSON.stringify({ threw: String(overriddenRun.threw ?? ''), node4: rectSubmitted[1]?.['4']?.inputs ?? null }))
 assert('F-2 the frozen override target is unchanged in the caller\'s graph',
-  JSON.stringify(frozenOverridden) === overriddenBefore && frozenOverridden['4'].inputs.width === '<width: 1024>',
+  JSON.stringify(frozenOverridden) === overriddenBefore && frozenOverridden['4'].inputs.width === 1024,
   JSON.stringify({ same: JSON.stringify(frozenOverridden) === overriddenBefore, width: frozenOverridden['4'].inputs.width }))
 
 const frozenSeeded = deepFreeze(posterCardWithNumericSeed())
@@ -1095,6 +1116,197 @@ assert('F-3 a frozen graph plus a top-level seed neither throws nor writes back'
     row: seededRow?.seed ?? null,
     same: JSON.stringify(frozenSeeded) === seededBefore,
   }))
+
+// --- F-7..F-22 (rectify segment 3, G-1): recipe-card placeholders ------------
+// The cards are read from their own files, unedited: `<name>` / `<name: default>`
+// values go in and a runnable graph comes out. What the cases pin down is that
+// the fill happens (a) only where a placeholder is, (b) with the TYPE the card
+// promised, (c) before `inputs` and before seed resolution, and (d) never on the
+// caller's object.
+const POSTER_PARAMS = {
+  ckpt_name: 'sd_xl_base_1.0.safetensors',
+  positive: 'a',
+  negative: 'b',
+  width: 512,
+  height: 512,
+  steps: 10,
+  cfg: 7.5,
+  sampler_name: 'euler',
+  scheduler: 'normal',
+  filename_prefix: 't',
+  seed: 7,
+}
+/** The names the poster card declares with no default: passing them is mandatory. */
+const POSTER_REQUIRED = { positive: 'a', negative: 'b', filename_prefix: 't', seed: 11 }
+
+rectSubmitted.length = 0
+async function rectRun(args, label) {
+  const index = rectSubmitted.length
+  try {
+    const result = await rectMount.toolFor('comfyui_run').execute({ ...args, run_label: `rect-g1-${label}` }, exec)
+    return { result, body: rectSubmitted[index], threw: null }
+  } catch (error) {
+    return { result: null, body: rectSubmitted[index], threw: error }
+  }
+}
+/** A refusal that happened before `openRun` opened a row (the documented shape). */
+const noRow = (label) => rectRows().find((entry) => entry.runLabel === `rect-g1-${label}`) === undefined
+/** The placeholder positions of a card, i.e. the only slots a fill may touch. */
+function placeholderPositions(card) {
+  const positions = new Set()
+  for (const [nodeId, node] of Object.entries(card)) {
+    for (const [key, value] of Object.entries(node.inputs)) {
+      if (typeof value === 'string' && value.includes('<') && value.includes('>')) positions.add(`${nodeId}.${key}`)
+    }
+  }
+  return positions
+}
+/** Every non-placeholder slot (and the node set) that changed during the fill. */
+function fidelityDiff(card, submitted) {
+  const positions = placeholderPositions(card)
+  const diff = []
+  for (const [nodeId, node] of Object.entries(card)) {
+    const got = submitted?.[nodeId]
+    if (got === undefined || got.class_type !== node.class_type) {
+      diff.push(`${nodeId}.class_type`)
+      continue
+    }
+    for (const [key, value] of Object.entries(node.inputs)) {
+      if (positions.has(`${nodeId}.${key}`)) continue
+      if (JSON.stringify(got.inputs[key]) !== JSON.stringify(value)) diff.push(`${nodeId}.${key}`)
+    }
+    for (const key of Object.keys(got.inputs)) {
+      if (!(key in node.inputs)) diff.push(`${nodeId}.${key}:added`)
+    }
+  }
+  if (Object.keys(submitted ?? {}).length !== Object.keys(card).length) diff.push('node-set')
+  return diff
+}
+
+const posterCard = readRecipeWorkflow('poster-sdxl-base')
+
+const f7 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: POSTER_PARAMS }, 'f7-0001')
+assert('F-7 a card submitted verbatim is filled from `params`, with the card\'s own types',
+  f7.threw === null && f7.result?.status === 'completed'
+  && f7.body?.['4']?.inputs?.width === 512 && typeof f7.body['4'].inputs.width === 'number'
+  && f7.body?.['5']?.inputs?.seed === 7 && typeof f7.body['5'].inputs.seed === 'number'
+  && f7.body?.['5']?.inputs?.steps === 10 && typeof f7.body['5'].inputs.steps === 'number'
+  && f7.body?.['2']?.inputs?.text === 'a' && f7.body?.['7']?.inputs?.filename_prefix === 't',
+  JSON.stringify({ threw: String(f7.threw ?? ''), status: f7.result?.status ?? null, error: f7.result?.error ?? null, body: f7.body ?? null }))
+
+const f8 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: POSTER_PARAMS }, 'f8-0001')
+assert('F-8 a string default takes a same-type string unchanged',
+  f8.threw === null && f8.body?.['1']?.inputs?.ckpt_name === 'sd_xl_base_1.0.safetensors',
+  JSON.stringify({ threw: String(f8.threw ?? ''), ckpt: f8.body?.['1']?.inputs?.ckpt_name ?? null }))
+
+const f9 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: { ...POSTER_REQUIRED, sampler_name: 3 } }, 'f9-0001')
+assert('F-9 E-2: a number passed to a string default is refused (no silent stringify)',
+  f9.threw !== null && /参数类型冲突/.test(f9.threw.message) && f9.threw.message.includes('sampler_name')
+  && /推断为 string/.test(f9.threw.message) && /为 number/.test(f9.threw.message)
+  && noRow('f9-0001') && f9.body === undefined,
+  JSON.stringify({ message: String(f9.threw?.message ?? ''), submitted: f9.body !== undefined }))
+
+const f10 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: { ...POSTER_REQUIRED, cfg: '7.5' } }, 'f10-0001')
+assert('F-10 a numeric string widens into a numeric default',
+  f10.threw === null && f10.body?.['5']?.inputs?.cfg === 7.5 && typeof f10.body['5'].inputs.cfg === 'number',
+  JSON.stringify({ threw: String(f10.threw ?? ''), cfg: f10.body?.['5']?.inputs?.cfg ?? null }))
+
+const f11 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: { ...POSTER_REQUIRED, cfg: 'abc' } }, 'f11-0001')
+assert('F-11 E-2: a non-numeric string for a numeric default is refused',
+  f11.threw !== null && /参数类型冲突/.test(f11.threw.message) && f11.threw.message.includes('cfg') && noRow('f11-0001'),
+  JSON.stringify(String(f11.threw?.message ?? '')))
+
+const f12 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: { ...POSTER_REQUIRED, steps: 30 } }, 'f12-0001')
+assert('F-12 a placeholder with a default falls back to it when nothing is passed',
+  f12.threw === null && f12.result?.status === 'completed'
+  && f12.body?.['5']?.inputs?.steps === 30
+  && f12.body?.['4']?.inputs?.width === 1024 && f12.body?.['4']?.inputs?.height === 1536
+  && f12.body?.['5']?.inputs?.sampler_name === 'euler' && f12.body?.['5']?.inputs?.cfg === 6.5,
+  JSON.stringify({ threw: String(f12.threw ?? ''), node4: f12.body?.['4']?.inputs ?? null, node5: f12.body?.['5']?.inputs ?? null }))
+
+const f13 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base') }, 'f13-0001')
+assert('F-13 E-3: a default-less placeholder with no value is refused, naming every one of them',
+  f13.threw !== null && /缺少必填参数/.test(f13.threw.message)
+  && ['positive', 'negative', 'seed', 'filename_prefix'].every((name) => f13.threw.message.includes(name))
+  && /node "2"\.text/.test(f13.threw.message) && noRow('f13-0001') && f13.body === undefined,
+  JSON.stringify({ message: String(f13.threw?.message ?? ''), submitted: f13.body !== undefined }))
+
+const inlineTextGraph = (text) => ({
+  '6': { class_type: 'CLIPTextEncode', inputs: { text, clip: ['4', 1] } },
+  '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: 'sd_xl_base_1.0.safetensors' } },
+})
+const f14 = await rectRun({ workflow: inlineTextGraph('a <subject> b'), params: { subject: 'cat' } }, 'f14-0001')
+assert('F-14 an embedded <name> is replaced as text inside the surrounding string',
+  f14.threw === null && f14.body?.['6']?.inputs?.text === 'a cat b',
+  JSON.stringify({ threw: String(f14.threw ?? ''), text: f14.body?.['6']?.inputs?.text ?? null }))
+
+const f15 = await rectRun({ workflow: inlineTextGraph('<a: b> c'), params: { a: 'x' } }, 'f15-0001')
+assert('F-15 E-1: a malformed placeholder is refused with node, input and a value snippet',
+  f15.threw !== null && /占位符语法非法/.test(f15.threw.message) && f15.threw.message.includes('node "6".text')
+  && f15.threw.message.includes('<a: b> c') && noRow('f15-0001') && f15.body === undefined,
+  JSON.stringify({ message: String(f15.threw?.message ?? ''), submitted: f15.body !== undefined }))
+
+const f16 = await rectRun({ workflow: inlineTextGraph('x <pos: y> z'), params: { pos: 'p' } }, 'f16-0001')
+assert('F-16 E-1: a default-carrying placeholder inside a string is refused',
+  f16.threw !== null && /占位符语法非法/.test(f16.threw.message) && noRow('f16-0001'),
+  JSON.stringify(String(f16.threw?.message ?? '')))
+
+const f17 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: POSTER_PARAMS }, 'f17-0001')
+const f17Diff = fidelityDiff(posterCard, f17.body)
+assert('F-17 the fill touches only the placeholder positions (class types, links, node set untouched)',
+  f17Diff.length === 0 && f17.body?.['4']?.inputs?.batch_size === 1 && f17.body?.['5']?.inputs?.denoise === 1.0
+  && JSON.stringify(f17.body?.['2']?.inputs?.clip) === JSON.stringify(['1', 1])
+  && JSON.stringify(f17.body?.['5']?.inputs?.latent_image) === JSON.stringify(['4', 0]),
+  JSON.stringify({ diff: f17Diff, batch: f17.body?.['4']?.inputs?.batch_size ?? null, clip: f17.body?.['2']?.inputs?.clip ?? null }))
+
+const cnCard = readRecipeWorkflow('controlnet-guide')
+const CN_PARAMS = {
+  ckpt_name: 'sd_xl_base_1.0.safetensors', positive: 'p', negative: 'n',
+  width: 896, height: 1152, steps: 20, cfg: 6.0, sampler_name: 'euler', scheduler: 'normal',
+  filename_prefix: 'cn', seed: 3,
+  cn_ref_image: 'm1_s1.png', cn_model: 'diffusion_pytorch_model_promax.safetensors',
+  cn_type: 'canny/lineart/anime_lineart/mlsd', cn_strength: 0.7, cn_start_percent: 0.0, cn_end_percent: 1.0,
+}
+const f18 = await rectRun({ workflow: readRecipeWorkflow('controlnet-guide'), params: CN_PARAMS }, 'f18-0001')
+assert('F-18 the six cn_* placeholders go through the same mechanism, with numeric types kept',
+  f18.threw === null && f18.result?.status === 'completed'
+  && f18.body?.['8']?.inputs?.image === 'm1_s1.png'
+  && f18.body?.['10']?.inputs?.control_net_name === 'diffusion_pytorch_model_promax.safetensors'
+  && f18.body?.['11']?.inputs?.type === 'canny/lineart/anime_lineart/mlsd'
+  && f18.body?.['12']?.inputs?.strength === 0.7 && typeof f18.body['12'].inputs.strength === 'number'
+  && f18.body?.['12']?.inputs?.start_percent === 0 && typeof f18.body['12'].inputs.start_percent === 'number'
+  && f18.body?.['12']?.inputs?.end_percent === 1 && typeof f18.body['12'].inputs.end_percent === 'number'
+  && fidelityDiff(cnCard, f18.body).length === 0,
+  JSON.stringify({ threw: String(f18.threw ?? ''), diff: fidelityDiff(cnCard, f18.body), node12: f18.body?.['12']?.inputs ?? null }))
+
+const f19 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: { ...POSTER_PARAMS, seed: 99 }, seed: 5 }, 'f19-0001')
+assert('F-19 a top-level seed still wins over the one injected from `params`',
+  f19.threw === null && f19.body?.['5']?.inputs?.seed === 5 && f19.result?.seed === 5,
+  JSON.stringify({ submitted: f19.body?.['5']?.inputs?.seed ?? null, result: f19.result?.seed ?? null }))
+
+const f20 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: { ...POSTER_PARAMS, seed: 99 } }, 'f20-0001')
+const f20Row = rectRows().find((entry) => entry.runLabel === 'rect-g1-f20-0001')
+assert('F-20 an injected numeric seed is adopted by seed resolution and recorded',
+  f20.threw === null && f20.body?.['5']?.inputs?.seed === 99
+  && f20.result?.seeds?.['5.seed'] === 99 && f20Row?.seeds?.['5.seed'] === 99,
+  JSON.stringify({ submitted: f20.body?.['5']?.inputs?.seed ?? null, result: f20.result?.seeds ?? null, row: f20Row?.seeds ?? null }))
+
+const f21 = await rectRun({ template: 'txt2img', params: { width: 512 } }, 'f21-0001')
+const f21Row = rectRows().find((entry) => entry.runLabel === 'rect-g1-f21-0001')
+assert('F-21 `params` on the template path injects nothing and is not an error',
+  f21.threw === null && f21.result?.status === 'completed' && f21.body?.['5']?.inputs?.width === 1024,
+  JSON.stringify({ threw: String(f21.threw ?? ''), width: f21.body?.['5']?.inputs?.width ?? null, error: f21.result?.error ?? null }))
+assert('F-21 unused names are recorded as params_ignored on the run',
+  JSON.stringify(f21Row?.params?.params_ignored) === JSON.stringify(['width']),
+  JSON.stringify(f21Row?.params ?? null))
+
+const f22array = await rectRun({ template: 'txt2img', params: [1, 2] }, 'f22a-0001')
+const f22scalar = await rectRun({ template: 'txt2img', params: 'x' }, 'f22b-0001')
+assert('F-22 E-5: `params` that is not an object is refused before anything is submitted',
+  f22array.threw?.message === 'comfyui_run: params must be an object keyed by placeholder name'
+  && f22scalar.threw?.message === 'comfyui_run: params must be an object keyed by placeholder name'
+  && noRow('f22a-0001') && noRow('f22b-0001'),
+  JSON.stringify({ array: String(f22array.threw?.message ?? ''), scalar: String(f22scalar.threw?.message ?? '') }))
 
 rectMount.dispose()
 rectServer.close()
