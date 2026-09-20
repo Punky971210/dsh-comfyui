@@ -478,11 +478,37 @@ function renderRunResult(_args: unknown, value: unknown): unknown[] {
 /**
  * Text of the first seed-keyed exception ComfyUI reported, so a failed run
  * still explains itself in one line.
+ *
+ * The empty state returns `''`, NOT a placeholder sentence. Every caller reads
+ * this through `|| <other source>` (or adds its own fallback), and a non-empty
+ * constant here made that `||` a dead branch: `firstErrorText(errors) ||
+ * error.message` could never fall through, so a ComfyUI run that failed for a
+ * reason with no node-level detail (a transport error, an abort, a successful
+ * execution whose post-processing threw) was recorded as the flat
+ * `'unknown error'` and the real cause was destroyed at the reporting site.
+ * Returning the empty string keeps "there is nothing to say here" and "the
+ * placeholder wording" in the caller, where the fallback wording lives.
  */
 function firstErrorText(errors: RunFailure['nodeErrors']): string {
   const first = errors?.[0]
-  if (first === undefined) return 'unknown error'
+  if (first === undefined) return ''
   return `${first.classType !== '' ? `${first.classType} ` : ''}${first.reason}`
+}
+
+/**
+ * The terminal state one `waitAndRecord` hands back to its caller.
+ *
+ * `failure` is the whole failure the recorder already wrote to the ledger,
+ * carried through so the caller reports the same text the row holds. It is
+ * nullable for every non-failure terminal (`completed`, `interrupted`), where
+ * the caller keeps its own wording.
+ */
+type TerminalState = {
+  status: RunResult['status']
+  media: RunMediaItem[]
+  durationMs: number
+  errors: RunFailure['nodeErrors']
+  failure: RunFailure | null
 }
 
 /**
@@ -503,7 +529,7 @@ async function waitAndRecord(
   timeoutMs: number | undefined,
   record: LedgerRecord,
   runDir: string,
-  onTerminal: (state: { status: RunResult['status']; media: RunMediaItem[]; durationMs: number; errors: RunFailure['nodeErrors'] }) => void,
+  onTerminal: (state: TerminalState) => void,
 ): Promise<ComfyUIHistoryEntry | undefined> {
   const startedAt = Date.now()
   try {
@@ -516,14 +542,14 @@ async function waitAndRecord(
     const media = collectMedia({ promptId, entry, maxItems: config.maxMediaItems, proxyBase: runtime.proxyBase() })
     const durationMs = Date.now() - startedAt
     upsertRun(runDir, { ...record, promptId, status: 'completed', durationMs, media: ledgerFiles(media) })
-    onTerminal({ status: 'completed', media, durationMs, errors: null })
+    onTerminal({ status: 'completed', media, durationMs, errors: null, failure: null })
     return entry
   } catch (error) {
     runtime.untrack(promptId)
     const durationMs = Date.now() - startedAt
     if (error instanceof Error && error.name === 'ComfyUIError' && error.message.includes('interrupted')) {
       upsertRun(runDir, { ...record, promptId, status: 'interrupted', durationMs })
-      onTerminal({ status: 'interrupted', media: [], durationMs, errors: null })
+      onTerminal({ status: 'interrupted', media: [], durationMs, errors: null, failure: null })
       return undefined
     }
     // A failed run is a terminal state too: the row is closed out with the
@@ -536,7 +562,13 @@ async function waitAndRecord(
       nodeErrors: errors,
     }
     upsertRun(runDir, { ...record, promptId, status: 'failed', durationMs, error: failure })
-    onTerminal({ status: 'error', media: [], durationMs, errors })
+    // `failure` is handed over WHOLE, not rebuilt by the caller from `errors`.
+    // Node-less failures (a transport error, an abort, a post-processing throw)
+    // carry `nodeErrors: null` and a message that exists only here — a caller
+    // that reassembles the message out of `errors` alone silently replaces the
+    // real cause with a placeholder, which is how the tool result and its
+    // ledger row came to disagree about the same run.
+    onTerminal({ status: 'error', media: [], durationMs, errors, failure })
     return entry
   }
 }
@@ -820,11 +852,7 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
                       seed,
                       seeds: Object.keys(seeds).length > 0 ? seeds : null,
                       ledger: runDir,
-                      error: state.errors === null ? null : {
-                        code: 'EXECUTION_FAILED',
-                        message: firstErrorText(state.errors),
-                        nodeErrors: state.errors,
-                      },
+                      error: state.failure,
                     }
                   },
                 )
@@ -855,9 +883,9 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
         return result
       }
 
-      let outcome: { status: RunResult['status']; media: RunMediaItem[]; durationMs: number; errors: RunFailure['nodeErrors'] } | undefined
+      let outcome: TerminalState | undefined
       await waitAndRecord(runtime, client, promptId, config, exec.signal, waitMs, base, runDir, (state) => { outcome = state })
-      const terminal = outcome ?? { status: 'error' as const, media: [], durationMs: Date.now() - startedAt, errors: null }
+      const terminal: TerminalState = outcome ?? { status: 'error', media: [], durationMs: Date.now() - startedAt, errors: null, failure: null }
       return {
         kind: 'sync',
         promptId,
@@ -869,11 +897,11 @@ function runDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefinition {
         seed,
         seeds: Object.keys(seeds).length > 0 ? seeds : null,
         ledger: runDir,
-        error: terminal.errors === null && terminal.status !== 'error' ? null : {
+        error: terminal.failure ?? (terminal.errors === null && terminal.status !== 'error' ? null : {
           code: 'EXECUTION_FAILED',
           message: firstErrorText(terminal.errors) || (terminal.status === 'interrupted' ? 'interrupted before completion' : 'unknown error'),
           nodeErrors: terminal.errors,
-        },
+        }),
       }
     },
   }
@@ -1382,11 +1410,7 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
                       seed: null,
                       seeds: null,
                       ledger: runDir,
-                      error: state.errors === null ? null : {
-                        code: 'EXECUTION_FAILED',
-                        message: firstErrorText(state.errors),
-                        nodeErrors: state.errors,
-                      },
+                      error: state.failure,
                     }
                   },
                 )
@@ -1414,9 +1438,9 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
         const background: BackgroundResult = { kind: 'background', jobId, promptId, runLabel, label: saved.name, seed: null, ledger: runDir }
         return { action: 'run', id, workflowName: saved.name, background }
       }
-      let outcome: { status: RunResult['status']; media: RunMediaItem[]; durationMs: number; errors: RunFailure['nodeErrors'] } | undefined
+      let outcome: TerminalState | undefined
       await waitAndRecord(runtime, client, promptId, config, exec.signal, waitMs, record, runDir, (state) => { outcome = state })
-      const terminal = outcome ?? { status: 'error' as const, media: [], durationMs: Date.now() - startedAt, errors: null }
+      const terminal: TerminalState = outcome ?? { status: 'error', media: [], durationMs: Date.now() - startedAt, errors: null, failure: null }
       const result: RunResult = {
         kind: 'sync',
         promptId,
@@ -1428,11 +1452,11 @@ function workflowDefinition(runtime: ComfyUIRuntime, ctx: Context): ToolDefiniti
         seed: null,
         seeds: null,
         ledger: runDir,
-        error: terminal.errors === null && terminal.status !== 'error' ? null : {
+        error: terminal.failure ?? (terminal.errors === null && terminal.status !== 'error' ? null : {
           code: 'EXECUTION_FAILED',
           message: firstErrorText(terminal.errors) || (terminal.status === 'interrupted' ? 'interrupted before completion' : 'unknown error'),
           nodeErrors: terminal.errors,
-        },
+        }),
       }
       return { action: 'run', id, workflowName: saved.name, runLabel, result }
     },

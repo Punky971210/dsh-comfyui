@@ -890,6 +890,100 @@ for (const root of ['../src', '../lib']) {
 assert('N-21 preflightApproved is gone from both src/ and lib/',
   deadExportHits.length === 0, JSON.stringify(deadExportHits))
 
+// --- F-4/F-5 (rectify segment 1, P4): a failure with no node detail ----------
+// The defect lives in `firstErrorText`'s CALLERS, not in the function alone, so
+// F-4 is behavioural rather than a unit test on a module-private helper: the
+// mock below answers a prompt whose history says "failed" while attaching no
+// exception detail at all — the shape the real 69.7 s run left behind (the
+// server reported `status_str: success`, the ledger row carried
+// `nodeErrors: null`, and the tool still reported a failure). Under the old
+// `firstErrorText` the only text that survived that shape was the flat
+// `'unknown error'`, which is exactly how the real cause was destroyed at the
+// reporting site. F-5 is the static half: all five call sites must carry their
+// own fallback so none of them can pass a possibly-empty string through as the
+// message.
+let rectSubmissions = 0
+/** What the mock's history says: failed without detail, or failed with one. */
+let rectHistoryMode = 'bare'
+const rectServer = createServer((request, response) => {
+  const url = new URL(request.url ?? '/', 'http://127.0.0.1')
+  const json = (body) => {
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify(body))
+  }
+  if (url.pathname === '/system_stats') {
+    return json({ system: { comfyui_version: '0.3.99-rectify' }, devices: [{ name: 'cuda:0 NVIDIA Rectify', type: 'cuda', vram_free: 4096 }] })
+  }
+  if (url.pathname === '/object_info') return json(OBJECT_INFO)
+  if (url.pathname === '/queue') return json({ queue_running: [], queue_pending: [] })
+  if (url.pathname === '/prompt') {
+    rectSubmissions += 1
+    return json({ prompt_id: `rect-prompt-${rectSubmissions}` })
+  }
+  if (url.pathname.startsWith('/history/')) {
+    const promptId = decodeURIComponent(url.pathname.slice('/history/'.length))
+    const messages = rectHistoryMode === 'detailed'
+      ? [['execution_error', { node_id: '3', node_type: 'KSampler', exception_message: 'RECT-REAL-ERROR-TEXT' }]]
+      : []
+    return json({ [promptId]: { status: { status_str: 'error', completed: false, messages }, outputs: {} } })
+  }
+  response.writeHead(404, { 'content-type': 'application/json' })
+  response.end(JSON.stringify({ error: `unexpected ${url.pathname}` }))
+})
+await new Promise((resolve) => rectServer.listen(0, '127.0.0.1', resolve))
+const rectPort = rectServer.address().port
+const rectMount = await mountPlugin(`http://127.0.0.1:${rectPort}`, undefined)
+const rectRows = () => readLedger(rectMount.runDir).records
+
+rectHistoryMode = 'bare'
+const bareRun = await rectMount.toolFor('comfyui_run').execute({ template: 'txt2img', run_label: 'rect-p4-bare-0001' }, exec)
+const bareRow = rectRows().find((entry) => entry.runLabel === 'rect-p4-bare-0001')
+assert('F-4 a failure carrying no node detail reports the raised cause, not the placeholder alone',
+  bareRun.status === 'error'
+  && bareRun.error?.message !== 'unknown error'
+  && /ComfyUI execution failed/.test(String(bareRun.error?.message ?? ''))
+  && String(bareRun.error?.message ?? '').includes(`rect-prompt-${rectSubmissions}`),
+  JSON.stringify({ status: bareRun.status, error: bareRun.error }))
+assert('F-4 the ledger row carries the same real message instead of the placeholder',
+  bareRow?.error?.message === bareRun.error?.message
+  && /ComfyUI execution failed/.test(String(bareRow?.error?.message ?? '')),
+  JSON.stringify(bareRow?.error ?? null))
+
+rectHistoryMode = 'detailed'
+const detailedRun = await rectMount.toolFor('comfyui_run').execute({ template: 'txt2img', run_label: 'rect-p4-detailed-0001' }, exec)
+const detailedRow = rectRows().find((entry) => entry.runLabel === 'rect-p4-detailed-0001')
+assert('F-6 a run that failed WITH node detail still reports that detail (unchanged by the fix)',
+  /RECT-REAL-ERROR-TEXT/.test(String(detailedRun.error?.message ?? ''))
+  && /RECT-REAL-ERROR-TEXT/.test(String(detailedRow?.error?.message ?? '')),
+  JSON.stringify({ result: detailedRun.error ?? null, ledger: detailedRow?.error ?? null }))
+
+const firstErrorCallLines = toolsSource.split('\n')
+  .map((line, index) => ({ line, number: index + 1 }))
+  .filter((entry) => /firstErrorText\(/.test(entry.line))
+  .filter((entry) => !/^\s*(\*|\/\/)/.test(entry.line))
+  .filter((entry) => !/function firstErrorText\(/.test(entry.line))
+assert('F-5 all remaining firstErrorText callsites carry a fallback (no bare call survives)',
+  firstErrorCallLines.length === 3 && firstErrorCallLines.every((entry) => entry.line.includes('||')),
+  JSON.stringify(firstErrorCallLines.map((entry) => `tools.ts:${entry.number} ${entry.line.trim()}`)))
+assert('F-5 the empty state of firstErrorText is the empty string, never a placeholder',
+  /function firstErrorText\([\s\S]{0,900}?if \(first === undefined\) return ''/.test(toolsSource),
+  JSON.stringify(toolsSource.slice(toolsSource.indexOf('function firstErrorText(')).split('\n').slice(0, 4)))
+// The two former bare callsites are not "fixed" by adding a fallback there:
+// they were rebuilding the failure out of `nodeErrors` alone and dropping the
+// message `waitAndRecord` had already put on the ledger row. The failure is now
+// handed over whole, which is what makes the tool result and its row agree.
+assert('F-4 the failure waitAndRecord recorded is handed to the caller whole (sync + async)',
+  (toolsSource.match(/error: state\.failure,/g) ?? []).length === 2
+  && (toolsSource.match(/error: terminal\.failure \?\?/g) ?? []).length === 2,
+  JSON.stringify({
+    async: (toolsSource.match(/error: state\.failure,/g) ?? []).length,
+    sync: (toolsSource.match(/error: terminal\.failure \?\?/g) ?? []).length,
+  }))
+
+rectMount.dispose()
+rectServer.close()
+rmSync(rectMount.dataDir, { recursive: true, force: true })
+
 slowServer.close()
 for (const dir of [concurrentDir, asyncDir, mounted.dataDir]) rmSync(dir, { recursive: true, force: true })
 for (const takeMount of takeoverMounts) {
