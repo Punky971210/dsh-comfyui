@@ -1308,6 +1308,148 @@ assert('F-22 E-5: `params` that is not an object is refused before anything is s
   && noRow('f22a-0001') && noRow('f22b-0001'),
   JSON.stringify({ array: String(f22array.threw?.message ?? ''), scalar: String(f22scalar.threw?.message ?? '') }))
 
+// --- F-26..F-34 (closeout segment A, B-1/N-2) --------------------------------
+// What these cases pin down is WHERE a placeholder is read from: only the site
+// snapshot taken before the injection, never the graph text after it.
+//
+// B-1 (F-26..F-30) is the defect the batch exists for: the convergence check used
+// to rescan every string of the cloned graph AFTER the write loop, so the caller's
+// own data — which had just been written into those very slots — was read back as
+// programme text and refused (E-4). Data is not programme text: a `<foo>` that
+// nothing in the card asked for, or `<positive>` inside the value being written
+// INTO `positive`, is payload and must survive verbatim.
+//
+// N-2 (F-31..F-34) states the other half of the same rule as a two-position
+// contract: one string, two fates. A `<a: b> c` sitting in the graph is template
+// source text and is refused (E-1, F-31 — the pre-existing F-15 case restated
+// beside its counterpart); the SAME string passed through `params` is data and is
+// injected unchanged (F-32). F-33 guards the opposite over-correction — an
+// unknown `<x>` next to a real site name must be left alone, not "converged" —
+// and F-34 guards the data-shaped-like-a-placeholder path (recipe spec 1.4b).
+//
+// The fixture is the poster card READ FROM ITS OWN FILE (F-7..F-22 use the same
+// door): `<positive>` is a whole-value site on node "2", `foo` is in no card.
+const b1Params = (over = {}) => ({ ...POSTER_REQUIRED, ...over })
+/** The card's own positive slot, i.e. the value the run actually submitted. */
+const b1Text = (run) => run.body?.['2']?.inputs?.text
+/** The run's own ledger row, matched on the run label `rectRun` built. */
+const b1Row = (label) => rectRows().find((entry) => entry.runLabel === `rect-g1-${label}`)
+/**
+ * `params_ignored` as the ledger records it: the key is written only when at
+ * least one name was ignored (tools.ts writes it spread-conditional, as F-21
+ * reads it), so "nothing ignored" is the absence of the key, not `[]`.
+ */
+const b1Ignored = (label) => b1Row(label)?.params?.params_ignored ?? []
+/** `raw` (what the caller passed) against `final` (what was submitted) — C-1's dump. */
+const b1Dump = (run, raw) => JSON.stringify({
+  raw,
+  final: b1Text(run) ?? null,
+  charEqual: b1Text(run) === raw,
+  threw: String(run.threw ?? ''),
+})
+
+const f26 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: b1Params({ positive: 'keep <foo> here', foo: 'BAR' }) }, 'f26-0001')
+const f26Row = b1Row('f26-0001')
+assert('F-26 (B1-R1) data holding an unknown <foo> is injected verbatim, is not E-4, and `foo` is reported ignored',
+  f26.threw === null && f26.result?.status === 'completed' && b1Text(f26) === 'keep <foo> here'
+  && JSON.stringify(f26Row?.params?.params_ignored) === JSON.stringify(['foo'])
+  && (f26Row?.error ?? null) === null && f26.result?.error === null,
+  b1Dump(f26, 'keep <foo> here') + ` ignored=${JSON.stringify(f26Row?.params?.params_ignored ?? null)} rowError=${JSON.stringify(f26Row?.error ?? null)}`)
+
+const f27 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: b1Params({ positive: 'keep <foo> here' }) }, 'f27-0001')
+const f27Row = b1Row('f27-0001')
+assert('F-27 (B1-R2) the same data with no extra name at all is injected verbatim and reports nothing ignored',
+  f27.threw === null && f27.result?.status === 'completed' && b1Text(f27) === 'keep <foo> here'
+  && JSON.stringify(b1Ignored('f27-0001')) === JSON.stringify([]),
+  b1Dump(f27, 'keep <foo> here') + ` ignored=${JSON.stringify(b1Row('f27-0001')?.params?.params_ignored ?? null)}`)
+
+const f28 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: b1Params({ positive: 'a <positive> b' }) }, 'f28-0001')
+const f28Row = b1Row('f28-0001')
+assert('F-28 (B1-R3) a data token naming the site itself is NOT re-substituted and NOT read as unconverged',
+  f28.threw === null && f28.result?.status === 'completed' && b1Text(f28) === 'a <positive> b'
+  && f28.body?.['5']?.inputs?.seed === POSTER_REQUIRED.seed
+  && JSON.stringify(b1Ignored('f28-0001')) === JSON.stringify([]),
+  b1Dump(f28, 'a <positive> b') + ` seed=${f28.body?.['5']?.inputs?.seed ?? null} ignored=${JSON.stringify(f28Row?.params?.params_ignored ?? null)}`)
+
+const f29 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: b1Params({ positive: '<a>' }) }, 'f29-0001')
+assert('F-29 (B1-R4) a value that is itself a literal placeholder shape is payload, injected character for character',
+  f29.threw === null && f29.result?.status === 'completed' && b1Text(f29) === '<a>'
+  && JSON.stringify(b1Ignored('f29-0001')) === JSON.stringify([]),
+  b1Dump(f29, '<a>'))
+
+const f30 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: b1Params({ positive: '<positive>' }) }, 'f30-0001')
+assert('F-30 (POS-3 / recipe spec 1.4b) a value equal to the site\'s own placeholder token is data, injected verbatim',
+  f30.threw === null && f30.result?.status === 'completed' && b1Text(f30) === '<positive>',
+  b1Dump(f30, '<positive>'))
+
+const f31 = await rectRun({ workflow: inlineTextGraph('<a: b> c'), params: { a: 'x' } }, 'f31-0001')
+assert('F-31 (N2-A, = F-15) the same string IN THE GRAPH stays template text and is refused with E-1',
+  f31.threw !== null && /占位符语法非法/.test(f31.threw.message) && f31.threw.message.includes('node "6".text')
+  && f31.threw.message.includes('<a: b> c') && noRow('f31-0001') && f31.body === undefined,
+  JSON.stringify({ message: String(f31.threw?.message ?? ''), submitted: f31.body !== undefined }))
+assert('F-31 the pair F-31/F-32 is the two-position contract itself: same string, opposite fate by position',
+  f31.threw !== null && f15.threw !== null, JSON.stringify({ graphSideThrew: f31.threw !== null, rerunOfF15Threw: f15.threw !== null }))
+
+const f32 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: b1Params({ positive: '<a: b> c' }) }, 'f32-0001')
+assert('F-32 (N2-B) the same string through `params` is data: accepted, and the slot holds it character for character',
+  f32.threw === null && f32.result?.status === 'completed' && b1Text(f32) === '<a: b> c',
+  b1Dump(f32, '<a: b> c'))
+
+const f33 = await rectRun({ workflow: inlineTextGraph('a <x> <positive> b'), params: { positive: 'VALUE' } }, 'f33-0001')
+assert('F-33 (N2-C) in an embedded site the known name is replaced and an unknown <x> is left alone, not refused',
+  f33.threw === null && f33.body?.['6']?.inputs?.text === 'a <x> VALUE b',
+  JSON.stringify({ threw: String(f33.threw ?? ''), text: f33.body?.['6']?.inputs?.text ?? null }))
+
+// The guard rails: a fix for B-1 that loosened the pre-write refusals would trade
+// one defect for a worse one, so these two reuse F-13/F-11's substance and pin the
+// exact message shape the moment a run is refused.
+const f34 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: {} }, 'f34-0001')
+assert('F-34 (POS-1) E-3 survives B-1: every default-less name and its location, refused before any row is opened',
+  f34.threw !== null && /缺少必填参数/.test(f34.threw.message)
+  && ['positive', 'negative', 'seed', 'filename_prefix'].every((name) => f34.threw.message.includes(name))
+  && /node "2"\.text/.test(f34.threw.message) && /node "7"\.filename_prefix/.test(f34.threw.message)
+  && noRow('f34-0001') && f34.body === undefined,
+  JSON.stringify({ message: String(f34.threw?.message ?? ''), submitted: f34.body !== undefined }))
+
+const f35 = await rectRun({ workflow: readRecipeWorkflow('poster-sdxl-base'), params: b1Params({ cfg: 'abc' }) }, 'f35-0001')
+assert('F-35 (POS-2) E-2 survives B-1: a contradictory type is still refused with name, inferred and passed type',
+  f35.threw !== null && /参数类型冲突/.test(f35.threw.message) && f35.threw.message.includes('cfg')
+  && f35.threw.message.includes('6.5') && /推断为 number/.test(f35.threw.message) && /为 string/.test(f35.threw.message)
+  && noRow('f35-0001'),
+  JSON.stringify(String(f35.threw?.message ?? '')))
+
+// Structural half of C-3/C-4: the two claims above are about behaviour, but the
+// rule that keeps the defect from coming back is positional — the convergence
+// judgement must live on `sites` and nowhere else. Reading `src/tools.ts` here
+// (not the built `lib/`) pins the form a reviewer will read.
+// `toolsSource` (read at the top for the static cases) is reused here rather
+// than read a second time, so both halves of the file describe one source.
+const toolsSourceLines = toolsSource.split('\n')
+const injectStart = toolsSourceLines.findIndex((line) => line.includes('function injectPlaceholders('))
+const injectEnd = toolsSourceLines.findIndex((line, index) => index > injectStart && line.startsWith('}'))
+assert('F-36 (C-3) the injection function exists and is delimited (the two checks below depend on that)',
+  injectStart >= 0 && injectEnd > injectStart,
+  JSON.stringify({ injectStart: injectStart + 1, injectEnd: injectEnd + 1 }))
+const injectLines = toolsSourceLines.slice(injectStart, injectEnd + 1)
+const patternUses = (pattern) => injectLines.reduce((count, line) => count + (line.match(new RegExp(pattern, 'g'))?.length ?? 0), 0)
+assert('F-36 (C-3) no placeholder regex is applied after the write loop: the one embedded rebuild, nothing else',
+  patternUses('EMBEDDED_PLACEHOLDER') === 1 && patternUses('WHOLE_PLACEHOLDER') === 0
+  && patternUses('INLINE_DEFAULT_PLACEHOLDER') === 0,
+  JSON.stringify({
+    whole: patternUses('WHOLE_PLACEHOLDER'),
+    embedded: patternUses('EMBEDDED_PLACEHOLDER'),
+    inlineDefault: patternUses('INLINE_DEFAULT_PLACEHOLDER'),
+    body: injectLines.length,
+  }))
+// The refusal text may not drift: it is what a reporter quotes back. The name it
+// interpolates is normalised away, so the comparison is about the wording alone.
+const fallbackLine = injectLines.find((line) => line.includes('注入未收敛')) ?? ''
+const fallbackTemplate = fallbackLine.replace(/\$\{[^}]*\}/g, '<site>').replace(/^.*?`/, '').replace(/`.*$/, '')
+assert('F-36 (C-4) the E-4 fallback is inside that function, exactly once, with its wording unchanged',
+  injectLines.filter((line) => line.includes('注入未收敛')).length === 1
+  && fallbackTemplate === 'comfyui_run: 注入未收敛 — 仍有占位符残留: <site>。这是实现缺陷，请附本条与工作流 JSON 上报。',
+  JSON.stringify({ occurrences: injectLines.filter((line) => line.includes('注入未收敛')).length, template: fallbackTemplate }))
+
 // --- F-P3 (rectify segment 4, P3): a success whose post-processing failed -----
 // The real incident recorded a run as `failed` whose image was on the server and
 // whose `/history` said success. Two defects had to line up: the failure text was

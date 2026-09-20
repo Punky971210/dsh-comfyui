@@ -365,6 +365,11 @@ interface PlaceholderSite {
   fallback: string | undefined
 }
 
+/** The `nodeId` + `inputKey` pair that identifies one injection site. */
+function siteAddress(site: PlaceholderSite): string {
+  return `${site.nodeId}\u0000${site.inputKey}`
+}
+
 /** A `params` value after the default's type rules have been applied to it. */
 interface ResolvedPlaceholder {
   value: string | number | boolean
@@ -463,14 +468,34 @@ function resolvePlaceholder(
  *
  * The write is confined to the placeholder positions: every other input value,
  * every `class_type`, node key and link array passes through untouched, which is
- * what lets a card file be submitted verbatim. A leftover placeholder after the
- * pass is an implementation defect, not a caller error, and is refused as such.
+ * what lets a card file be submitted verbatim.
+ *
+ * A value is read as placeholder syntax or as data depending on WHERE it comes
+ * from, and the two never mix (recipes spec C-6):
+ *
+ * - (A) a value already in the graph is template source text, so it is the only
+ *   thing that may carry syntax — a whole `<name>` / `<name: default>` is a slot,
+ *   and a default-carrying or half-open `<…>` is refused as E-1.
+ * - (B) a `params` value is the caller's payload: it is NEVER parsed, never
+ *   re-read as syntax and never matched against a placeholder pattern. It lands
+ *   byte for byte, whatever it looks like, so `'<a: b> c'`, `'<foo>'`, `'<a>'`
+ *   and `'<positive>'` are all just strings (recipes spec 2.2 B).
+ *
+ * The injection therefore runs once, over the (A) slots; (B) values written into
+ * them are thereafter data, which is why nothing below may scan the graph again.
  */
 function injectPlaceholders(
   workflow: Record<string, { class_type: string; inputs: Record<string, unknown> }>,
   params: Record<string, unknown>,
 ): { ignored: string[] } {
-  const sites = collectPlaceholders(workflow)
+  // A text value may carry `<x>` for a name that declares nothing: no slot of
+  // its own and no `params` entry. Inside an embedded site such a token is data
+  // — `"a <x> <positive> b"` declares `positive`, and `x` is just characters —
+  // so it is not a slot, is not substituted, is not reported missing, and is
+  // passed through as authored (recipes spec 1.4 c). Only tokens the caller
+  // actually handed over can be slots of their own.
+  const sites = collectPlaceholders(workflow).filter((site) => site.whole || site.fallback !== undefined
+    || Object.prototype.hasOwnProperty.call(params, site.name))
   // Refused as one list, with every location: a card is filled in one call, so
   // naming one missing parameter at a time would cost one round trip per slot.
   const absent = [...new Set(sites
@@ -486,34 +511,61 @@ function injectPlaceholders(
     )
   }
   const resolved = new Map<string, ResolvedPlaceholder>()
+  /** The names this graph actually declares — the only tokens of the template. */
+  const names = new Set(sites.map((site) => site.name))
   for (const site of sites) {
     if (resolved.has(site.name)) continue
     resolved.set(site.name, resolvePlaceholder(site, params))
   }
+  // The write pass itself is the record of what was filled: a site is remembered
+  // here the moment its slot is rewritten, so the judgement below never has to
+  // look at a value to decide whether a write happened.
+  //
+  // That distinction is the whole repair. Deciding it from the value is
+  // undecidable in general — `params.positive = '<positive>'` writes exactly the
+  // text the slot already held, so "did the write happen" and "does the slot
+  // still look like its template" cannot both be read off the string; and
+  // deciding it from the GRAPH TEXT (the old implementation) read the caller's
+  // own payload back as programme text: `'a <positive> b'` and `'keep <foo>
+  // here'` were refused as unconverged recipes (recipes spec 1.4 a/b).
+  //
+  // (A) values in the graph are the template; (B) values out of `params` are
+  // data, never re-parsed and never matched against a placeholder pattern.
+  const filledSites = new Map<string, PlaceholderSite>()
   for (const site of sites) {
     const value = resolved.get(site.name)!.value
     workflow[site.nodeId]!.inputs[site.inputKey] = site.whole
       ? value
       // An embedded placeholder always lands as text: the surrounding string
-      // fixes the type, so there is nothing to infer.
+      // fixes the type, so there is nothing to infer. Only names this graph
+      // declares are substituted — a `<x>` that names no site is data inside the
+      // template (recipes spec 1.4 c), so it is left exactly as authored and is
+      // never reported missing.
       : site.raw.replace(EMBEDDED_PLACEHOLDER, (match, name: string) => {
-        const replacement = resolved.get(name)
+        const replacement = names.has(name) ? resolved.get(name) : undefined
         return replacement === undefined ? match : String(replacement.value)
       })
+    filledSites.set(siteAddress(site), site)
   }
-  const leftover = new Set<string>()
-  for (const node of Object.values(workflow)) {
-    for (const value of Object.values(node.inputs ?? {})) {
-      if (typeof value !== 'string') continue
-      const whole = WHOLE_PLACEHOLDER.exec(value)
-      if (whole !== null) leftover.add(whole[1]!)
-      for (const embedded of value.matchAll(EMBEDDED_PLACEHOLDER)) leftover.add(embedded[1]!)
-    }
+  // E-4 is an internal invariant, NOT a check on what the caller sent.
+  //
+  // The loop above walks `sites` and rewrites each one, so every site is in
+  // `filledSites` on every path through this function; the only way a site can
+  // be missing is that the rewrite was lost (a loop that skips, an early
+  // continue, a site added after the pass). The branch is unreachable in normal
+  // operation and exists to fail loudly (fail-fast) rather than submit a graph
+  // still carrying a recipe placeholder.
+  //
+  // It deliberately reads no string of the graph: after the loop those strings
+  // are the caller's payload, and scanning them for placeholder shapes is the
+  // B-1 defect this replaces.
+  const unfilled = sites.find((site) => !filledSites.has(siteAddress(site)))
+  if (unfilled !== undefined) {
+    throw new Error(`comfyui_run: 注入未收敛 — 仍有占位符残留: ${unfilled.name}。这是实现缺陷，请附本条与工作流 JSON 上报。`)
   }
-  if (leftover.size > 0) {
-    throw new Error(`comfyui_run: 注入未收敛 — 仍有占位符残留: ${[...leftover].join(', ')}。这是实现缺陷，请附本条与工作流 JSON 上报。`)
-  }
-  const names = new Set(sites.map((site) => site.name))
+  // Names handed over that no placeholder in this graph asked for: a caller
+  // reusing one `params` map across recipes is normal, so this is recorded
+  // rather than refused.
   return { ignored: Object.keys(params).filter((name) => !names.has(name)) }
 }
 
