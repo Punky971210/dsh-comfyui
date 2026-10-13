@@ -6,7 +6,7 @@
  * the extract (拆分) choices in the panel and the agent-facing skill.
  */
 
-import { normalizeLinks } from './graph.js'
+import { isVirtualNodeType, normalizeLinks, resolveVirtualLinks } from './graph.js'
 
 export interface GraphNodeLike {
   id: number
@@ -81,12 +81,16 @@ export function analyzeGraph(graph: unknown): GraphAnalysis | { ok: false; error
     return { ok: false, error: '无法解析图文件（缺少 nodes/links）' }
   }
   const nodes = graph.nodes as GraphNodeLike[]
-  const links = normalizeLinks(graph.links)
+  // Virtual nodes (Set/Get wireless links, rgthree mode relays) are rewired
+  // out first, exactly as conversion does, so components follow the real data
+  // flow and the virtual nodes themselves never show up as components or as
+  // dangling nodes (Issue #8).
+  const links = resolveVirtualLinks(graph.nodes, normalizeLinks(graph.links))
   const groups = Array.isArray(graph.groups) ? (graph.groups as GraphGroupLike[]) : []
 
-  const active = nodes.filter((node) => node.mode !== 4)
+  const active = nodes.filter((node) => node.mode !== 4 && !isVirtualNodeType(node.type))
   const activeById = new Map(active.map((node) => [node.id, node]))
-  const bypassedCount = nodes.length - active.length
+  const bypassedCount = nodes.filter((node) => node.mode === 4).length
 
   // Dangling nodes: active but touching no link at all.
   const linkedIds = new Set<number>()
@@ -98,13 +102,34 @@ export function analyzeGraph(graph: unknown): GraphAnalysis | { ok: false; error
     .filter((node) => !linkedIds.has(node.id))
     .map((node) => ({ id: node.id, type: node.type }))
 
+  // Bypassed nodes are pass-throughs at conversion time (resolveOrigin in
+  // convert.ts: the output follows the FIRST wired input). Mirror that rule
+  // here, or a chain `120 → [406 bypassed] → 119` splits into two components
+  // and "main flow" extraction ships 119 referencing a node it left out
+  // (Issue #8).
+  const linkById = new Map(links.map((link) => [link[0], link]))
+  const nodeById = new Map(nodes.map((node) => [node.id, node]))
+  const passThroughOrigin = (originId: number): number | undefined => {
+    let current = originId
+    const visited = new Set<number>()
+    while (nodeById.get(current)?.mode === 4) {
+      if (visited.has(current)) return undefined
+      visited.add(current)
+      const inputLink = (nodeById.get(current)?.inputs ?? []).find((entry) => entry.link !== null)?.link
+      const upstream = inputLink === undefined || inputLink === null ? undefined : linkById.get(inputLink)
+      if (upstream === undefined) return undefined
+      current = upstream[1]
+    }
+    return current
+  }
+
   // Connected components over linked active nodes.
   const adjacency = new Map<number, Set<number>>()
   for (const node of active) adjacency.set(node.id, new Set())
   for (const link of links) {
-    const a = link[1]
+    const a = passThroughOrigin(link[1])
     const b = link[3]
-    if (typeof a !== 'number' || typeof b !== 'number') continue
+    if (a === undefined) continue
     if (!adjacency.has(a) || !adjacency.has(b)) continue
     adjacency.get(a)!.add(b)
     adjacency.get(b)!.add(a)
